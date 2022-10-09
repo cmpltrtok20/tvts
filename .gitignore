@@ -3,6 +3,7 @@
 *.tmp.*
 .svn
 _save
+_data
 #
 # Python.gitignore
 #

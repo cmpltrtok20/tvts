@@ -440,7 +440,7 @@ The CLI options and the --help option is similar to x200\_fake\_demo\_samulating
 
 The prompt on how to use tvts.py to visualize the data is similar to x100\_fake\_demo\_simple.py.
 
-Actually, this file invoked common PyTorch code in [PyCmpltrtok](https://github.com/cmpltrtok20/PyCmpltrtok) ( also a project of mine ) that contains the usage of TVTS.
+Actually, this file invoked common PyTorch code in [PyCmpltrtok](https://github.com/cmpltrtok20/PyCmpltrtok/blob/master/common_torch.py) ( also a project of mine ) that contains the usage of TVTS.
 
 # How to visualize the user's recorded information
 
