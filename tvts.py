@@ -179,7 +179,8 @@ class Tvts(object):
         Specify the starting point of this training and get the path to the saved model or weights.
 
         :param xtrain_id: From which training to resume.
-        :param xepoch: From which epoch of that training to resume. If xepoch = 0, we will resume the last epoch with saved weights.
+        :param xepoch: From which epoch of that training to resume.
+                       If xepoch = 0, we will resume it is the last epoch with saved weights.
         :param keys_of_data_to_restore: Which keys to restore from the parent record.
         :return: None (xtrain_id=0) or List[ relative path to saved weights, dir of the base ]
         """
@@ -441,7 +442,8 @@ class TvtsVisualization(object):
             temp_repr = 'only temporary data'
         else:
             temp_repr = 'all data'
-        xinfo_bar = f'Name: {self.name} from {self.host}:{self.port} {self.db_name}.{self.table_name} @{str(datetime.datetime.now())[:-3]} ({temp_repr})\nSpecified save_dir: "{self.save_dir}"'
+        xinfo_bar = f'Name: {self.name} from {self.host}:{self.port} {self.db_name}.{self.table_name}' \
+                    f' @{str(datetime.datetime.now())[:-3]} ({temp_repr})\nSpecified save_dir: "{self.save_dir}"'
         print(xinfo_bar)
 
     def summary(self, keys_str: Optional[str] = None) -> None:
@@ -584,7 +586,15 @@ class TvtsVisualization(object):
             last_row = cur[0]
             first_row = cur[count - 1]
             for k in keys_str:
-                xvalue_dict[k] = dict(begin=first_row.get(k, na), end=last_row.get(k, na), min=na, max=na, exp=na, std=na, val=[])
+                xvalue_dict[k] = dict(
+                    begin=first_row.get(k, na),
+                    end=last_row.get(k, na),
+                    min=na,
+                    max=na,
+                    exp=na,
+                    std=na,
+                    val=[]
+                )
 
             count_path, count_path_exists = 0, 0
             for irow in cur:
@@ -980,7 +990,8 @@ class TvtsVisualization(object):
             xm_list_train_ids.append(xi_train_id)
             xi_map = find_record(xi_train_id, xi_up_to_epoch)
             if xi_map is None:
-                print(f'> Error: find no record with train_id {xi_train_id} ! If there are only batch records, please add -b to arguments.')
+                print(f'> Error: find no record with train_id {xi_train_id} !' \
+                      f' If there are only batch records, please add -b to arguments.')
                 return
             xm_train_id2map_map[xi_train_id] = xi_map
             xi_train_id = int(xi_map.get('parent_id', 0))
@@ -992,7 +1003,8 @@ class TvtsVisualization(object):
 
         # validate ancestors
         if xm_since_train_id and not xm_since_train_id in xm_set_train_ids:
-            raise TvtsException(f'The training id ({xm_since_train_id}) you specified as "since" is not an ancestor of this training ({xm_train_id})!')
+            raise TvtsException(f'The training id ({xm_since_train_id}) you specified as "since"' \
+                                f' is not an ancestor of this training ({xm_train_id})!')
 
         # build global epoch numbers
         xm_list_global_entries = ['key2glb_x_map', 'key2glb_x_map_with_save_path']
@@ -1078,7 +1090,11 @@ class TvtsVisualization(object):
                 # the curve
                 dots = xi_ax1.plot(xm_key2glb_x_map[k], xm_key2y_map[k], label=k, linewidth=1, alpha=0.7)
                 # the dots representing epoch with saved model or weights
-                xi_ax1.scatter(xm_key2glb_x_map_with_save_path[k], xm_key2y_map_with_save_path[k], s=4, color='black', marker='s', alpha=0.7)
+                xi_ax1.scatter(
+                    xm_key2glb_x_map_with_save_path[k],
+                    xm_key2y_map_with_save_path[k],
+                    s=4, color='black', marker='s', alpha=0.7
+                )
                 # collect data for drawing when hovering over the curve
                 dots = dots[0]
                 xm_list_of_tuple_ax_dots_key.append((xi_ax1, dots, k))
@@ -1097,7 +1113,10 @@ class TvtsVisualization(object):
             xi_ax2.legend()
 
             xi_last_base = xm_train_id2map_map[xm_list_train_ids_show[-1]]['base_epoch']
-            xi_2nd_xaxis = xi_ax1.secondary_xaxis('top', functions=(lambda x: x - xi_last_base, lambda x: x + xi_last_base))
+            xi_2nd_xaxis = xi_ax1.secondary_xaxis(
+                'top',
+                functions=(lambda x: x - xi_last_base, lambda x: x + xi_last_base)
+            )
             # xi_2nd_xaxis.set_xlabel('Epoch in this turn')
 
             xi_annot = xi_ax1.annotate(
@@ -1143,7 +1162,8 @@ class TvtsVisualization(object):
                 row = xi_epoch2row_map[xi_local_epoch]
                 xi_hyper_val = row[xm_hyper]
                 xi_hyper_repr = get_better_repr(xi_hyper_val)
-                xc_text = f'global epoch={xc_global_epoch}, train_id={xi_train_id}, epoch={xi_local_epoch}, {xc_key}={xc_y_repr}, {xm_hyper}={xi_hyper_repr}'
+                xc_text = f'global epoch={xc_global_epoch}, train_id={xi_train_id}, epoch={xi_local_epoch},' \
+                          f' {xc_key}={xc_y_repr}, {xm_hyper}={xi_hyper_repr}'
                 xc_text = long_text_to_block(xc_text, xm_hover_box_width)
                 break  # just show the first match
             if xc_text is None:  # no matched data
@@ -1318,19 +1338,30 @@ if '__main__' == __name__:
 
         tvtsv = TvtsVisualization(name, temp_arg, host, port, db, prefix, save_dir)
 
-        def plot_train_id(xtrain_id, xmetrics_groups=metrics_groups, xsince=0, xhyper=None, is_4batch=False, xmetrics_groups_4batch=None, xepoch_range='0:0'):
+        def plot_train_id(
+                xtrain_id,
+                xmetrics_groups=metrics_groups,
+                xsince=0,
+                xhyper=None,
+                is_4batch=False,
+                xmetrics_groups_4batch=None,
+                xepoch_range='0:0'
+        ):
             try:
                 xhyper_str = ''
                 if xhyper is not None:
                     xhyper_str = f'with hyper parameter {xhyper}'
                 if not is_4batch:
                     if xsince:
-                        print(f'> Visualizing training with id of {xtrain_id} from id of {xsince} with metrics_groups {xmetrics_groups} {xhyper_str}')
+                        print(f'> Visualizing training with id of {xtrain_id} from id of {xsince}' \
+                              f' with metrics_groups {xmetrics_groups} {xhyper_str}')
                     else:
-                        print(f'> Visualizing training with id of {xtrain_id} with metrics_groups {xmetrics_groups} {xhyper_str}')
+                        print(f'> Visualizing training with id of {xtrain_id} with' \
+                              f' metrics_groups {xmetrics_groups} {xhyper_str}')
                     tvtsv.plot(xtrain_id, xmetrics_groups, xsince, xhyper)
                 else:
-                    print(f'> Visualizing batch records ONLY of training with id of {xtrain_id} with metrics_groups {xmetrics_groups_4batch} {xhyper_str}')
+                    print(f'> Visualizing batch records ONLY of training with id of {xtrain_id} with' \
+                          f' metrics_groups {xmetrics_groups_4batch} {xhyper_str}')
                     tvtsv.plot_4batch(xtrain_id, xmetrics_groups_4batch, xhyper, xepoch_range)
             except Exception as ex:
                 print(ex)
@@ -1338,11 +1369,23 @@ if '__main__' == __name__:
         cli_parser = ArgumentParser(prog='Input:')
         cli_parser.add_argument('train_id', help='id of the training you want to check', type=int, nargs='?', default=0)
         cli_parser.add_argument('-s', '--since', help='since which ancestor id you want to check', type=int, default=0)
-        cli_parser.add_argument('-m', '--metrics', help='CSV list of metrics groups, each group is vertical bar separated string', type=str, default=None)
-        cli_parser.add_argument('--batch_metrics', help='CSV list of metrics groups for batch, each group is vertical bar separated string', type=str, default=None)
+        cli_parser.add_argument(
+            '-m', '--metrics',
+            help='CSV list of metrics groups, each group is vertical bar separated string',
+            type=str, default=None
+        )
+        cli_parser.add_argument(
+            '--batch_metrics',
+            help='CSV list of metrics groups for batch, each group is vertical bar separated string',
+            type=str, default=None
+        )
         cli_parser.add_argument('--hyper', help='the hyper param to check', type=str, default=None)
         cli_parser.add_argument('-b', '--batch', help='only check batch records of this train_id', action='store_true')
-        cli_parser.add_argument('--epoch_range', help='the epoch range when check batch records', type=str, default='0:0')
+        cli_parser.add_argument(
+            '--epoch_range',
+            help='the epoch range when check batch records',
+            type=str, default='0:0'
+        )
 
         regexp4sepc_keys = re.compile(r'^\s*(m|bm|hyper|keys)=(\S+)\s*$', re.IGNORECASE)
         regexp4spec_temp = re.compile(r'^\s*temp\s*\=\s*(0|1|-1)\s*$', re.IGNORECASE)
@@ -1445,7 +1488,9 @@ if '__main__' == __name__:
             print(f'> Or: Input "m/bm/hyper/keys=value" to change corresponding keys.')
             print(f'> Or: Input "temp=0/1/-1" to show summary table of only temporary data, only formal data, or all data.')
             print(f'> Or: Input "dir=/path/of/dir/of/saved/weights" to specify save_dir.')
-            print(f'> Or: Do the plotting by CLI command like: [-s SINCE] [-m METRICS(default: {metrics_groups})] [--batch_metrics BATCH_METRICS(default: {metrics_groups_4batch})] [--hyper HYPER=(default: {hyper})] [-b] [--epoch_range(default: 0:0)] train_id')
+            print(f'> Or: Do the plotting by CLI command like: [-s SINCE] [-m METRICS(default: {metrics_groups})]' \
+                  f' [--batch_metrics BATCH_METRICS(default: {metrics_groups_4batch})]' \
+                  f' [--hyper HYPER=(default: {hyper})] [-b] [--epoch_range(default: 0:0)] train_id')
             input_list = input_value_util_well()
             if len(input_list) == 0:
                 print('> Bye!')
@@ -1463,6 +1508,14 @@ if '__main__' == __name__:
                 xx_hyper = hyper
             if xx_metrics_groups_4batch is None:
                 xx_metrics_groups_4batch = metrics_groups_4batch
-            plot_train_id(xx_train_id, xx_metrics_groups, xx_since, xx_hyper, xx_is_4batch, xx_metrics_groups_4batch, xx_epoch_range)
+            plot_train_id(
+                xx_train_id,
+                xx_metrics_groups,
+                xx_since,
+                xx_hyper,
+                xx_is_4batch,
+                xx_metrics_groups_4batch,
+                xx_epoch_range
+            )
 
     _main()
