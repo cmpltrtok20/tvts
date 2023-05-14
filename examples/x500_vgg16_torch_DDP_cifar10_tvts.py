@@ -2,12 +2,61 @@ import os
 import sys
 import torch
 import numpy as np
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, distributed
 from PyCmpltrtok.common import sep
 from PyCmpltrtok.common_np import uint8_to_flt_by_lut
 from PyCmpltrtok.common_torch import torch_compile, torch_acc_top1, torch_acc_top2, torch_fit, torch_evaluate, torch_infer
 from PyCmpltrtok.common_gpgpu import get_gpu_indexes_from_env
 import tvts.tvts as tvts
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
+import pkg_resources as pkg
+import platform
+
+
+def emojis(str=''):
+    """Steal from YOLO v5"""
+    # Return platform-dependent emoji-safe version of string
+    return str.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str
+
+
+def check_version(current='0.0.0', minimum='0.0.0', name='version ', pinned=False, hard=False, verbose=False):
+    """Steal from YOLO v5"""
+    # Check version vs. required version
+    current, minimum = (pkg.parse_version(x) for x in (current, minimum))
+    result = (current == minimum) if pinned else (current >= minimum)  # bool
+    s = f'WARNING ⚠️ {name}{minimum} is required by YOLOv5, but {name}{current} is currently installed'  # string
+    if hard:
+        assert result, emojis(s)  # assert min requirements met
+    if verbose and not result:
+        print(s, file=sys.stderr)
+    return result
+
+
+def smart_DDP(model, local_rank):
+    """Steal from YOLO v5"""
+    # Model DDP creation with checks
+    assert not check_version(torch.__version__, '1.12.0', pinned=True), \
+        'torch==1.12.0 torchvision==0.13.0 DDP training is not supported due to a known issue. ' \
+        'Please upgrade or downgrade torch to use DDP. See https://github.com/ultralytics/yolov5/issues/8395'
+    if check_version(torch.__version__, '1.11.0'):
+        return DDP(model, device_ids=[local_rank], output_device=local_rank, static_graph=True)
+    else:
+        return DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+
+def setup(rank):
+    if -1 == rank:
+        return
+    dist.init_process_group("nccl", init_method='env://')
+
+
+def cleanup(rank):
+    if -1 == rank:
+        return
+    dist.destroy_process_group()
 
 
 ###############################################################################################################
@@ -112,7 +161,16 @@ if '__main__' == __name__:
 
     def _main():
         """ The main program. """
-        sep('VGG16 by PyTorch on Cifar10 with TVTS')
+        sep('VGG16 by PyTorch DDP on Cifar10 with TVTS')
+        try:
+            local_rank, rank, world_size = 0, -1, 1
+            local_rank, rank, world_size = [int(x) for x in (os.environ['LOCAL_RANK'], os.environ['RANK'], os.environ['WORLD_SIZE'],)]
+        except Exception as ex:
+            print(ex, file=sys.stderr)
+        flag = f'{local_rank}/{rank}/{world_size}'
+        sep(f'{flag} start')
+        setup(rank)
+        print(flag, 'init_process_group done')
 
         ###############################################################################################################
         # Hyper params and switches (start)
@@ -182,6 +240,12 @@ if '__main__' == __name__:
             IS_TRAIN = 0
         if not IS_TRAIN:
             sep('No training, just testing and demonstrating', char='<', rchar='>')
+            if -1 != rank:
+                print(f'Now, WORLD_SIZE={world_size}, and evaluation mode should not be in parallel!', file=sys.stderr)
+                exit(-2)
+        elif -1 == rank:
+            print('This program is intented for DDP!', file=sys.stderr)
+            exit(-3)
         # group #3
         PARENT_TRAIN_ID = args.pi
         PARENT_EPOCH = args.pe
@@ -254,9 +318,9 @@ if '__main__' == __name__:
         # device_id = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         n_gpus = torch.cuda.device_count()
         if not n_gpus:
-            device_id = 'cpu'
+            raise Exception('You must have one or more GPU to use this program.')
         else:
-            gpu_id = n_gpus - 1
+            gpu_id = local_rank
             device_id = f'cuda:{gpu_id}'
         device = torch.device(device_id)
         visible_gpus = get_gpu_indexes_from_env()
@@ -267,6 +331,9 @@ if '__main__' == __name__:
         # the model
         sep('The model')
         model = VGG(10, (3, 32, 32)).to(device)
+        if -1 != rank:
+            dist.barrier()  # Synchronizes all processes.
+            model = smart_DDP(model, local_rank)
         # print(model)
         model_dict = torch_compile(
             ts, device, model, torch.nn.NLLLoss(),
@@ -275,6 +342,7 @@ if '__main__' == __name__:
                 'top1': torch_acc_top1,
                 'top2': torch_acc_top2,
             },
+            rank=rank
         )
 
         # load data
@@ -298,13 +366,19 @@ if '__main__' == __name__:
         x_train = uint8_to_flt_by_lut(x_train)
         x_test = uint8_to_flt_by_lut(x_test)
         # to tensor
-        x_train = torch.Tensor(x_train)
-        x_test = torch.Tensor(x_test)
-        y_train = torch.Tensor(y_train)
-        y_test = torch.Tensor(y_test)
+        if -1 == rank:
+            x_train = torch.Tensor(x_train)
+            x_test = torch.Tensor(x_test)
+            y_train = torch.Tensor(y_train)
+            y_test = torch.Tensor(y_test)
+        else:
+            x_train = torch.Tensor(x_train).to(local_rank)
+            x_test = torch.Tensor(x_test).to(local_rank)
+            y_train = torch.Tensor(y_train).to(local_rank)
+            y_test = torch.Tensor(y_test).to(local_rank)
         # to Dataset
         ds_test = TensorDataset(x_test, y_test)
-        dl_test = DataLoader(ds_test, N_BATCH_SIZE, drop_last=False)
+        dl_test = DataLoader(ds_test, N_BATCH_SIZE, drop_last=False, shuffle=False)
 
         # restore check point
         if CKPT_PATH is None:
@@ -351,9 +425,14 @@ if '__main__' == __name__:
         
             ds_train = TensorDataset(x_train, y_train)
             ds_val = TensorDataset(x_test, y_test)
-            dl_train = DataLoader(ds_train, N_BATCH_SIZE, drop_last=True, shuffle=True)
-            dl_val = DataLoader(ds_val, N_BATCH_SIZE, drop_last=False)
-            torch_fit(model_dict, dl_train, dl_val, N_EPOCHS)
+            if -1 == rank:
+                dl_train = DataLoader(ds_train, N_BATCH_SIZE, drop_last=True, shuffle=True)
+                dl_val = DataLoader(ds_val, N_BATCH_SIZE, drop_last=False, shuffle=False)
+            else:
+                dl_train = DataLoader(ds_train, N_BATCH_SIZE, drop_last=True, shuffle=False, sampler=distributed.DistributedSampler(ds_train, shuffle=True))
+                dl_val = DataLoader(ds_val, N_BATCH_SIZE, drop_last=False, shuffle=False)
+            dist.barrier()  # Synchronizes all processes.
+            torch_fit(model_dict, dl_train, dl_val, N_EPOCHS, world_size=world_size)
         # train (end)
         ###############################################################################################################
 
@@ -368,29 +447,35 @@ if '__main__' == __name__:
 
         ###############################################################################################################
         # demo (start)
-        sep('Demo')
-        spr = 4
-        spc = 5
-        spn = 0
-        plt.figure(figsize=[10, 8])
-        n_demo = spr * spc
-        x_demo = x_test.numpy()[:n_demo]
-        y_demo = y_test.numpy().astype(int)[:n_demo]
-        h_demo = torch_infer(x_demo, model, device, batch_size=8).argmax(axis=1)
-        for i in range(n_demo):
-            spn += 1
-            plt.subplot(spr, spc, spn)
-            htype = label_names[h_demo[i]]
-            gttype = label_names[y_demo[i]]
-            right = True if htype == gttype else False
-            title = gttype if right else f'{htype}(gt: {gttype})'
-            plt.title(title, color="black" if right else "red")
-            plt.axis('off')
-            plt.imshow(np.transpose(x_test[i].reshape(*shape_), (1, 2, 0)))
-        print('Check and close the plotting window to continue ...')
-        plt.show()
+        if rank in set([0, -1]):
+            sep('Demo')
+            spr = 4
+            spc = 5
+            spn = 0
+            plt.figure(figsize=[10, 8])
+            n_demo = spr * spc
+            x_demo = x_test.cpu().numpy()[:n_demo]
+            y_demo = y_test.cpu().numpy().astype(int)[:n_demo]
+            h_demo = torch_infer(x_demo, model, device, batch_size=8).argmax(axis=1)
+            for i in range(n_demo):
+                spn += 1
+                plt.subplot(spr, spc, spn)
+                htype = label_names[h_demo[i]]
+                gttype = label_names[y_demo[i]]
+                right = True if htype == gttype else False
+                title = gttype if right else f'{htype}(gt: {gttype})'
+                plt.title(title, color="black" if right else "red")
+                plt.axis('off')
+                plt.imshow(np.transpose(x_demo[i].reshape(*shape_), (1, 2, 0)))
+            print('Check and close the plotting window to continue ...')
+            plt.show()
         # demo (end)
         ###############################################################################################################
+
+        sep(f'{flag} start cleanup')
+        cleanup(rank)
+        sep(f'{flag} cleanup end')
+        sep(f'{flag} end')
 
     _main()  # Main program entrance
     sep('All over')

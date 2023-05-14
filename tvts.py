@@ -3,10 +3,9 @@ import pymongo as pm
 import os
 import sys
 import datetime
-import matplotlib.pyplot as plt
-from texttable import Texttable
 import numpy as np
 from typing import Optional, List, Sequence
+from PyCmpltrtok.common import long_text_to_block
 
 DEFAULT_HOST = 'localhost'
 DEFAULT_PORT = 27017
@@ -59,17 +58,6 @@ def get_better_repr(val) -> str:
 def shorter_dt(dt: datetime.datetime) -> str:
     assert isinstance(dt, datetime.datetime)
     return '\n'.join(dt.strftime(DATETIME_FORMAT).split(' '))
-
-
-def long_text_to_block(xm_text: str, xm_width: int) -> str:
-    assert isinstance(xm_text, str)
-    assert isinstance(xm_width, int)
-
-    xi_len_of_text = len(xm_text)
-    xi_n_lines = int(np.ceil(xi_len_of_text / xm_width))
-    xi_lines = [xm_text[i * xm_width:(i + 1) * xm_width] for i in range(xi_n_lines)]
-    xm_text = '\n'.join(xi_lines)
-    return xm_text
 
 
 class Tvts(object):
@@ -143,6 +131,7 @@ class Tvts(object):
             self.params['init_weights'] = self.init_weights
         # datetime recorder
         self.dt = datetime.datetime.now()
+        self.dt4batch = datetime.datetime.now()
 
     def conn(self) -> None:
         self.client = pm.MongoClient(self.host, self.port)
@@ -168,6 +157,7 @@ class Tvts(object):
         :return: void
         """
         self.dt = datetime.datetime.now()
+        self.dt4batch = datetime.datetime.now()
 
     def resume(
             self,
@@ -278,6 +268,10 @@ class Tvts(object):
         # datetime of record
         xnow = datetime.datetime.now()
         data['datetime'] = xnow
+        data['from_datetime'] = self.dt4batch
+        data['to_datetime'] = xnow
+        data['duration_in_sec'] = (xnow - self.dt4batch).total_seconds()
+        self.dt4batch = xnow
 
         # insert data into db
         # IMPORTANT: db and table will be newly created at the 1st insertion if they are not there yet.
@@ -1251,6 +1245,8 @@ class TvtsVisualization(object):
 if '__main__' == __name__:
     import argparse
     import time
+    import matplotlib.pyplot as plt
+    from texttable import Texttable
 
     def _main():
 
@@ -1486,7 +1482,7 @@ if '__main__' == __name__:
             print(f'> Help info:')
             print(f'> Directly press ENTER to show the summary table. Input q/Q/quit to quit.')
             print(f'> Or: Input "m/bm/hyper/keys=value" to change corresponding keys.')
-            print(f'> Or: Input "temp=0/1/-1" to show summary table of only temporary data, only formal data, or all data.')
+            print(f'> Or: Input "temp=0/1/-1" to show summary table of only formal data, only temporary data, or all data.')
             print(f'> Or: Input "dir=/path/of/dir/of/saved/weights" to specify save_dir.')
             print(f'> Or: Do the plotting by CLI command like: [-s SINCE] [-m METRICS(default: {metrics_groups})]' \
                   f' [--batch_metrics BATCH_METRICS(default: {metrics_groups_4batch})]' \
