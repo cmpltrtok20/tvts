@@ -529,7 +529,7 @@ if '__main__' == __name__:
         spr = 4
         spc = 5
         spn = 0
-        plt.figure(figsize=[10, 8])
+        plt.figure(figsize=[8, 6])
         n_demo = spr * spc
         x_demo = x_test.numpy()[:n_demo]
         y_demo = y_test.numpy().astype(int)[:n_demo]
