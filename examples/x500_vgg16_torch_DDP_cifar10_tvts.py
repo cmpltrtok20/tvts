@@ -1,3 +1,13 @@
+"""
+Temporay:
+LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2
+LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2
+
+Former:
+LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py -n 4
+LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py -n 4
+"""
+
 import os
 import sys
 import torch
