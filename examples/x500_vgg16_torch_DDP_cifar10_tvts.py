@@ -200,7 +200,7 @@ if '__main__' == __name__:
         # specify or override params from CLI
         parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
         # group #1
-        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_vgg16_torch_cifar10_03')
+        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_vgg16_torch_cifar10_DDP')
         parser.add_argument('--memo', help='The memo.', type=str, default='(no memo)')
         parser.add_argument('--temp', help='Run as temporary code', action='store_true')
         parser.add_argument('-t', '--test', help='Only run testing phase, no training.', action='store_true')
