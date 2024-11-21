@@ -1,11 +1,34 @@
 """
-Temporay:
-LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2
-LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2
 
-Former:
-LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py -n 4
-LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py -n 4
+#Python
+
+Temporay:
+LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2 --pi 15
+LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2 --pi 15
+
+Temporay: (single node, single GPU)
+LOCAL_RANK=0 RANK=0 WORLD_SIZE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2 --pi 15
+
+Formal:
+LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py -n 6 --batch 512
+LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x500_vgg16_torch_DDP_cifar10_tvts.py -n 6 --batch 512
+
+#torch.distributed.launch Single-node
+
+Temporay:
+python -m torch.distributed.launch --nproc-per-node=2 --use-env x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2
+
+Formal:
+python -m torch.distributed.launch --nproc-per-node=2 --use-env x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 6 --batch 512
+
+#torch.distributed.launch Multi-node (Currently I have only one node available)
+
+Temporay:
+python -m torch.distributed.launch --nproc-per-node=2 --use-env --nnodes=1 --node-rank=0 --master-addr="192.168.31.227" --master-port=6666 x500_vgg16_torch_DDP_cifar10_tvts.py --temp -n 2 --pi 15
+
+Formal:
+python -m torch.distributed.launch --nproc-per-node=2 --use-env --nnodes=1 --node-rank=0 --master-addr="192.168.31.227" --master-port=6666 x500_vgg16_torch_DDP_cifar10_tvts.py -n 2 --pi 15
+
 """
 
 import os
@@ -168,19 +191,11 @@ if '__main__' == __name__:
     import matplotlib.pyplot as plt
     import argparse
     import PyCmpltrtok.data.cifar10.load_cifar10 as cifar10
+    from PyCmpltrtok.auth.redis.conn import conn
+    from PyCmpltrtok.auth.mongo.conn import conn as mconn
 
     def _main():
         """ The main program. """
-        sep('VGG16 by PyTorch DDP on Cifar10 with TVTS')
-        try:
-            local_rank, rank, world_size = 0, -1, 1
-            local_rank, rank, world_size = [int(x) for x in (os.environ['LOCAL_RANK'], os.environ['RANK'], os.environ['WORLD_SIZE'],)]
-        except Exception as ex:
-            print(ex, file=sys.stderr)
-        flag = f'{local_rank}/{rank}/{world_size}'
-        sep(f'{flag} start')
-        setup(rank)
-        print(flag, 'init_process_group done')
 
         ###############################################################################################################
         # Hyper params and switches (start)
@@ -216,6 +231,7 @@ if '__main__' == __name__:
         parser.add_argument('--save_dir', help='The dir where weights saved.', type=str, default=SAVE_DIR)
         # group #4
         parser.add_argument('--init_weights', help='The path to the stored weights to init the model.', type=str, default=None)
+        parser.add_argument('--link', help='config name of the mongodb', type=str, default=tvts.DEFAULT_LINK)
         parser.add_argument('--host', help='Host of the mongodb for tvts.', type=str, default=tvts.DEFAULT_HOST)
         parser.add_argument('--port', help='Port of the mongodb for tvts.', type=str, default=tvts.DEFAULT_PORT)
         # parse CLI args
@@ -224,6 +240,41 @@ if '__main__' == __name__:
         # group #1
         NAME = args.name
         assert len(NAME) > 0
+        
+        # Ensure args are identical.
+        sep('Check if all args match between processes')
+        keys = sorted(args.__dict__.keys())
+        xdict = {}
+        for k in keys:
+            xdict[k] = args.__dict__[k]
+        xdict_value = f'{xdict}'
+        this_path = os.path.abspath(__file__)
+        redis_key = f'{this_path}:{NAME}'
+        rdb = conn('local')
+        redis_value = rdb.get(redis_key)
+        if redis_value is None:
+            rdb.set(redis_key, xdict_value.encode('utf8'))
+            print('The first process')
+        else:
+            redis_value = redis_value.decode('utf8')
+            print('Redis:', redis_value)
+            print('This :', xdict_value)
+            assert redis_value == xdict_value, 'All arguments of all processes must match!'
+            print('OK')
+        
+        sep('VGG16 by PyTorch DDP on Cifar10 with TVTS')
+        try:
+            local_rank, rank, world_size = 0, -1, 1
+            local_rank, rank, world_size = [int(x) for x in (os.environ['LOCAL_RANK'], os.environ['RANK'], os.environ['WORLD_SIZE'],)]
+        except Exception as ex:
+            print(ex, file=sys.stderr)
+        flag = f'{local_rank}/{rank}/{world_size}'
+        sep(f'{flag} start')
+        setup(rank)
+        print(flag, 'init_process_group done')
+        print(f'Removing Redis arg checking item {redis_key}')
+        rdb.delete(redis_key)
+        
         memo = args.memo
         MEMO += '; ' + memo
         TEMP = args.temp
@@ -268,6 +319,14 @@ if '__main__' == __name__:
         INIT_WEIGHTS = args.init_weights
         MONGODB_HOST = args.host
         MONGODB_PORT = args.port
+        link = args.link
+        if link is not None:
+            client = mconn(link)
+            host = client.HOST
+            port = client.PORT
+        else:
+            client = None
+            link = None
         # init weights or parent training is mutual exclusion with each other
         if PARENT_TRAIN_ID and INIT_WEIGHTS:
             raise tvts.TvtsException(f'You cannot specify parent_id={PARENT_TRAIN_ID} and init_weights={INIT_WEIGHTS} at the same time!')
@@ -289,6 +348,7 @@ if '__main__' == __name__:
             NAME,
             memo=MEMO,
             is_temp=TEMP,
+            mongo_link=client,
             host=MONGODB_HOST, port=MONGODB_PORT,
             save_freq=SAVE_FREQ, save_dir=SAVE_DIR,
             init_weights=INIT_WEIGHTS,
@@ -316,7 +376,11 @@ if '__main__' == __name__:
                 print(f'Restored: LR={LR}, GAMMA={GAMMA}')
         print(f'CKPT_PATH={CKPT_PATH}')
         print('Use below CLI command to visualize this training by TVTS:')
-        print(f'python3 /path/to/tvts/tvts.py --host "{MONGODB_HOST}" --port {MONGODB_PORT} -m "loss|loss_val,top1|top1_val|top2|top2_val" --batch_metrics "loss,top1|top2" -k "top1_val" --save_dir "{SAVE_DIR}" "{NAME}"')
+        if link is None:
+            mongo_str = f'--host "{MONGODB_HOST}" --port {MONGODB_PORT}'
+        else:
+            mongo_str = f'--link "{link}"'
+        print(f'python3 /path/to/tvts/tvts.py {mongo_str} -m "loss|loss_val,top1|top1_val|top2|top2_val" --batch_metrics "loss,top1|top2" -k "top1_val" --save_dir "{SAVE_DIR}" "{NAME}"')
         # tvts init and resume (end)
         ###############################################################################################################
 
@@ -432,6 +496,7 @@ if '__main__' == __name__:
             print('N_SAMPLE_AMOUNT:', N_SAMPLE_AMOUNT, file=sys.stderr)
             print('N_BATCH_SIZE:', N_BATCH_SIZE, file=sys.stderr)
             print('n_batches (per epoch):', n_batches, file=sys.stderr)
+            print('N_VAL', len(dl_test))
         
             ds_train = TensorDataset(x_train, y_train)
             ds_val = TensorDataset(x_test, y_test)
@@ -448,10 +513,11 @@ if '__main__' == __name__:
 
         ###############################################################################################################
         # test (start)
-        sep('Test')
-        print('Evaluating ...')
-        avg_loss_test, avg_metric_test = torch_evaluate(model_dict, dl_test)
-        print(f'avg_loss_test={avg_loss_test}, avg_metric_test={avg_metric_test}')
+        if rank in set([0, -1]):
+            sep('Test')
+            print('Evaluating ...')
+            avg_loss_test, avg_metric_test = torch_evaluate(model_dict, dl_test)
+            print(f'avg_loss_test={avg_loss_test}, avg_metric_test={avg_metric_test}')
         # test (end)
         ###############################################################################################################
 
@@ -466,7 +532,7 @@ if '__main__' == __name__:
             n_demo = spr * spc
             x_demo = x_test.cpu().numpy()[:n_demo]
             y_demo = y_test.cpu().numpy().astype(int)[:n_demo]
-            h_demo = torch_infer(x_demo, model, device, batch_size=8).argmax(axis=1)
+            h_demo = torch_infer(x_demo, model.module, device, batch_size=8).argmax(axis=1)
             for i in range(n_demo):
                 spn += 1
                 plt.subplot(spr, spc, spn)

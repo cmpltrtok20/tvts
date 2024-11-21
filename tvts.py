@@ -4,14 +4,25 @@ import os
 import sys
 import datetime
 import numpy as np
-from typing import Optional, List, Sequence
-from PyCmpltrtok.common import long_text_to_block
+from typing import Optional, List, Sequence, Union
+from collections.abc import Iterable
+import requests
+import json
+import traceback
+import copy
+import math
+from dataclasses import dataclass
 
+from PyCmpltrtok.common import long_text_to_block, md5, has_content
+from PyCmpltrtok.auth.mongo.conn import conn
+
+DEFAULT_LINK = 'local'
 DEFAULT_HOST = 'localhost'
 DEFAULT_PORT = 27017
 DEFAULT_DB_NAME = 'tvts'
 DEFAULT_TABLE_PREFIX = 'train_log'
 DEFAULT_SAVE_FREQ = 1
+DEFAULT_LOCATE_SERVICE_PORT = 7654
 INDEX_NAME = 'id_epoch'
 MUST_PARAMS = set(['epoch'])
 INDEX_NAME_4BATCH = 'id_epoch_batch'
@@ -35,6 +46,28 @@ RESERVED_KEYS = set([
     'to_datetime',
     'train_id',
 ])
+
+LOCAT_SERVICE_PWD = 'my_password_001'
+
+
+def locate_service(path, host, port):
+    xjson = dict()
+    xjson['path'] = path
+    xjson['check'] = md5(path + LOCAT_SERVICE_PWD)
+
+    if port is None:
+        port = DEFAULT_LOCATE_SERVICE_PORT
+
+    res = requests.post(f'http://{host}:{port}/api', json=xjson, timeout=3.0)
+    xjson = json.loads(res.text)
+    result = xjson['result']
+    return result
+
+
+def is_exist(path, host=None, port=None):
+    if host is None or host in set(['localhost', '127.0.0.1']):
+        return has_content(path)[1]
+    return locate_service(path, host, port)
 
 
 class TvtsException(Exception):
@@ -60,21 +93,39 @@ def shorter_dt(dt: datetime.datetime) -> str:
     return '\n'.join(dt.strftime(DATETIME_FORMAT).split(' '))
 
 
+@dataclass
 class Tvts(object):
+
+    name: str
+    host: str
+    port: int
+    db_name: str
+    table_name: str
+    table_name_4batch: str
+    train_id: int
+    is_temp: bool
+    params: dict
+    save_freq: int
+    save_dir: str
+    memo: Optional[str] = 'No MEMO.'
+    init_weights: Optional[str] = None
 
     def __init__(
             self,
             name: str,
-            memo: Optional[str] = '(No memo)',
-            is_temp: Optional[bool] = False,
+            mongo_link: Optional[pm.MongoClient] = None,
             host: Optional[str] = DEFAULT_HOST,
             port: Optional[int] = DEFAULT_PORT,
             db: Optional[str] = DEFAULT_DB_NAME,
             table_prefix: Optional[str] = DEFAULT_TABLE_PREFIX,
+            old_train_id: Optional[int] = None,
+            memo: Optional[str] = '(No memo)',
+            is_temp: Optional[bool] = False,
             save_freq: Optional[int] = DEFAULT_SAVE_FREQ,
             save_dir: Optional[str] = None,
             init_weights: Optional[str] = None,
-            params: Optional[dict] = {}
+            params: Optional[dict] = {},
+            **kwargs,
     ):
         assert isinstance(name, str)
         assert isinstance(memo, str)
@@ -85,56 +136,94 @@ class Tvts(object):
         assert isinstance(table_prefix, str)
         assert isinstance(params, dict)
         assert isinstance(save_freq, int)
-        if save_dir is None:
-            raise TvtsException(f'Please specify the save_dir at where weights are saved!')
-        else:
-            assert isinstance(save_dir, str)
+        if old_train_id is not None:
+            assert isinstance(old_train_id, int)
+        if old_train_id is None:
+            if save_dir is None:
+                raise TvtsException(f'Please specify the save_dir at where weights are saved!')
+            else:
+                assert isinstance(save_dir, str)
         if init_weights is not None:
             assert isinstance(init_weights, str) and len(init_weights) > 0
+        if old_train_id is not None:
+            self.is_resume = True
+        else:
+            self.is_resume = False
 
         memo = '(tvts.py) ' + memo
         self.name = name
-        self.memo = memo
-        self.is_temp = is_temp
 
-        self.host = host
-        self.port = port
+        self.mongo_link = mongo_link
+        if self.mongo_link is not None:
+            self.host = self.mongo_link.HOST
+            self.port = self.mongo_link.PORT
+        else:
+            self.host = host
+            self.port = port
         self.db_name = db
         self.table_name = table_prefix + '_' + name
         self.table_name_4batch = table_prefix + '_' + name + '_4batch'
 
-        self.params = params
-        for k in self.params.keys():
-            if k in RESERVED_KEYS:
-                raise TvtsException(f'Key "{k}" is reserved and cannot be used by the user.')
-
-        self.save_freq = save_freq
-        self.save_dir = save_dir
-        self.init_weights = init_weights
-
         # conn
         self.conn()
 
-        # get train id
-        self.train_id = self._get_next_train_id()
-        print(f'> TVTS: id of this training is {self.train_id}', file=sys.stderr)
+        if old_train_id is not None:
+            # get train id
+            self.train_id = old_train_id
+            cur = self.table.find({
+                'train_id': self.train_id,
+            }).sort('epoch', pm.ASCENDING)
+            first_row = None
+            for first_row in cur:
+                break
+            if first_row is None:
+                raise TvtsException(f'Old train id {old_train_id} is not existed!')
 
-        # set important params
-        self.params['name'] = self.name
-        self.params['memo'] = self.memo
-        self.params['is_temp'] = int(self.is_temp)
+            self.memo = first_row['memo']
+            self.is_temp = first_row['is_temp']
 
-        self.params['train_id'] = self.train_id
-        self.params['save_freq'] = self.save_freq
-        self.params['save_dir'] = self.save_dir
-        if self.init_weights is not None:
-            self.params['init_weights'] = self.init_weights
+            self.params = copy.deepcopy(first_row)
+            del self.params['_id']
+            self.save_freq = first_row['save_freq']
+            self.save_dir = first_row['save_dir']
+            self.init_weights = first_row.get('init_weights', None)
+        else:
+            # get train id
+            self.train_id = self._get_next_train_id()
+            print(f'> TVTS: id of this training is {self.train_id}', file=sys.stderr)
+
+            self.memo = memo
+            self.is_temp = is_temp
+
+            self.params = params
+            for k in self.params.keys():
+                if k in RESERVED_KEYS:
+                    raise TvtsException(f'Key "{k}" is reserved and cannot be used by the user.')
+
+            self.save_freq = save_freq
+            self.save_dir = save_dir
+            self.init_weights = init_weights
+
+            # set important params
+            self.params['name'] = self.name
+            self.params['memo'] = self.memo
+            self.params['is_temp'] = int(self.is_temp)
+
+            self.params['train_id'] = self.train_id
+            self.params['save_freq'] = self.save_freq
+            self.params['save_dir'] = self.save_dir
+            if self.init_weights is not None:
+                self.params['init_weights'] = self.init_weights
+
         # datetime recorder
         self.dt = datetime.datetime.now()
         self.dt4batch = datetime.datetime.now()
 
     def conn(self) -> None:
-        self.client = pm.MongoClient(self.host, self.port)
+        if self.mongo_link is not None:
+            self.client = self.mongo_link
+        else:
+            self.client = pm.MongoClient(self.host, self.port)
         self.db = self.client[self.db_name]
         self.table = self.db[self.table_name]
         self.table_4batch = self.db[self.table_name_4batch]
@@ -175,7 +264,8 @@ class Tvts(object):
         :return: None (xtrain_id=0) or List[ relative path to saved weights, dir of the base ]
         """
         assert isinstance(xtrain_id, int)
-        assert isinstance(xepoch, int)
+        assert isinstance(xepoch, float) or isinstance(xepoch, int)
+        xepoch = float(xepoch)
         if keys_of_data_to_restore is not None:
             assert isinstance(keys_of_data_to_restore, Sequence)
             for el in keys_of_data_to_restore:
@@ -196,13 +286,15 @@ class Tvts(object):
                 raise TvtsException(f'resume: There is no saved weight in train with id {xtrain_id}!')
             ckpt = ckpts[0]
         else:
-            xepoch = int(xepoch)
             if xepoch <= 0:
                 raise TvtsException(f'Epoch value {xepoch} must be >= 1!')
             ckpt = self.table.find_one({
                 'train_id': xtrain_id,
                 'epoch': xepoch,
             })
+            if ckpt is None:
+                print(f'PI={xtrain_id}, PE={xepoch} is not found!')
+                return None
 
         # validate
         if ckpt is None:
@@ -221,7 +313,7 @@ class Tvts(object):
 
         # set parent
         self.params['parent_id'] = xtrain_id
-        self.params['parent_epoch'] = int(ckpt['epoch'])
+        self.params['parent_epoch'] = float(ckpt['epoch'])
 
         return save_rel_path, ckpt['save_dir']
 
@@ -231,17 +323,17 @@ class Tvts(object):
 
     def save_batch(
             self,
-            xepoch: int,
+            xepoch: float,
             xbatch: int,
             params: Optional[dict] = {},
             is_batch_global: Optional[bool] = False
     ) -> None:
-        req = 'Epoch and Batch must be integers equal to or greater than 1 !'
+        req = 'Epoch must be decimal equal to or greater than 0.0. Batch must be integers equal to or greater than 1 !'
         ex = TvtsException(req)
         try:
-            xepoch = int(xepoch)
+            xepoch = float(xepoch)
             xbatch = int(xbatch)
-            if xepoch <= 0:
+            if xepoch < 0:
                 raise ex
             if xbatch <= 0:
                 raise ex
@@ -254,7 +346,7 @@ class Tvts(object):
             raise vex
 
         # a copy of params
-        data = self.params.copy()
+        data = copy.deepcopy(self.params)
         # apply update
         for k in params.keys():
             v = params[k]
@@ -275,7 +367,23 @@ class Tvts(object):
 
         # insert data into db
         # IMPORTANT: db and table will be newly created at the 1st insertion if they are not there yet.
-        self.table_4batch.insert_one(data)
+        # self.table_4batch.insert_one(data)
+        glb = data.get('global_batch', None)
+        if glb is not None:
+            self.table_4batch.update_one({
+                'train_id': self.train_id,
+                'global_batch': glb,
+            }, {
+                '$set': data,
+            },  upsert=True)
+        else:
+            self.table_4batch.update_one({
+                'train_id': self.train_id,
+                'epoch': xepoch,
+                'batch': xbatch,
+            }, {
+                '$set': data,
+            },  upsert=True)
 
         # add index if it is not there yet
         indexes = set(self.table_4batch.index_information().keys())
@@ -295,16 +403,16 @@ class Tvts(object):
 
     def save_epoch(
             self,
-            xepoch: int,
+            xepoch: float,
             params: Optional[dict] = {},
             save_rel_path=None,
             save_dir=None
     ) -> None:
-        req = 'Epoch must be a integer equal to or greater than 1 !'
+        req = 'Epoch must be a positive decimal !'
         ex = TvtsException(req)
         try:
-            xepoch = int(xepoch)
-            if xepoch <= 0:
+            xepoch = float(xepoch)
+            if xepoch <= 0.0:
                 raise ex
             params = dict(params)
             for k in params.keys():
@@ -316,10 +424,16 @@ class Tvts(object):
             raise vex
 
         # a copy of params
-        data = self.params.copy()
+        data = self.table.find_one({
+            'train_id': self.train_id,
+            'epoch': xepoch,
+        })
+        if data is None:
+            data = copy.deepcopy(self.params)
         # apply update
         for k in params.keys():
             v = params[k]
+            self.params.pop(k, None)  # This value does not belong to self.params but introduced by resuming old_train_id.
             data[k] = v
         data['epoch'] = xepoch
 
@@ -337,9 +451,16 @@ class Tvts(object):
         data['duration_in_sec'] = (xnow - self.dt).total_seconds()
         self.dt = xnow
 
-        # insert data into db
+        # upsert data into db
         # IMPORTANT: db and table will be newly created at the 1st insertion if they are not there yet.
-        self.table.insert_one(data)
+        # IMPORTANT: data with the existed key will be merged into the original data
+        # https://stackoverflow.com/questions/60883397/using-pymongo-upsert-to-update-or-create-a-document-in-mongodb-using-python
+        self.table.update_one({
+            'train_id': data['train_id'],
+            'epoch': data['epoch'],
+        }, {
+            '$set': data,
+        }, upsert=True)
 
         # add index if it is not there yet
         indexes = set(self.table.index_information().keys())
@@ -378,15 +499,21 @@ class TvtsVisualization(object):
 
     def __init__(
         self,
-        name: str,
+        name: Union[str, Sequence[str]],
         is_temp: Optional[bool] = None,
         host: Optional[str] = DEFAULT_HOST,
         port: Optional[int] = DEFAULT_PORT,
         db: Optional[str] = DEFAULT_DB_NAME,
         table_prefix: Optional[str] = DEFAULT_TABLE_PREFIX,
-        save_dir: Optional[str] = None
+        save_dir: Optional[str] = None,
+        client: Optional[pm.MongoClient] = None,
+        service_host: Optional[str] = None,
+        service_port: Optional[int] = None,
     ):
-        assert isinstance(name, str)
+        assert isinstance(name, str) or isinstance(name, Iterable)
+        if isinstance(name, Iterable):
+            for the_name in name:
+                assert isinstance(the_name, str)
         if is_temp is not None:
            assert isinstance(is_temp, bool)
         assert isinstance(host, str)
@@ -395,8 +522,15 @@ class TvtsVisualization(object):
         assert isinstance(table_prefix, str)
         if save_dir is not None:
             assert isinstance(save_dir, str)
+        if client is not None:
+            assert isinstance(client, pm.MongoClient)
 
-        self.name = name
+        if isinstance(name, str):
+            self.names = [name]
+        else:
+            self.names = []
+            for the_name in name:
+                self.names.append(the_name)
         if is_temp is not None:
             self.temp_value = int(is_temp)
         else:
@@ -404,15 +538,24 @@ class TvtsVisualization(object):
         self.host = host
         self.port = port
         self.db_name = db
-        self.table_name = table_prefix + '_' + self.name
-        self.table_name_4batch = table_prefix + '_' + self.name + '_4batch'
+        self.table_names = []
+        self.table_names_4batch = []
+        for the_name in self.names:
+            self.table_names.append(table_prefix + '_' + the_name)
+            self.table_names_4batch.append(table_prefix + '_' + the_name + '_4batch')
         self.save_dir = save_dir
 
+        self.service_host = service_host
+        self.service_port = service_port
+
         # conn
-        self.client = pm.MongoClient(host, port)
+        if client is not None:
+            self.client = client
+        else:
+            self.client = pm.MongoClient(host, port)
         self.db = self.client[self.db_name]
-        self.table = self.db[self.table_name]
-        self.table_4batch = self.db[self.table_name_4batch]
+        self.tables = [self.db[table_name] for table_name in self.table_names]
+        self.tables_4batch = [self.db[table_name] for table_name in self.table_names_4batch]
 
     def setTemp(self, is_temp: Optional[bool] = None) -> None:
         if is_temp is not None:
@@ -436,8 +579,12 @@ class TvtsVisualization(object):
             temp_repr = 'only temporary data'
         else:
             temp_repr = 'all data'
-        xinfo_bar = f'Name: {self.name} from {self.host}:{self.port} {self.db_name}.{self.table_name}' \
+        xinfo_bar = f'Name: {self.names[0]} from {self.host}:{self.port} {self.db_name}.{self.table_names[0]}' \
                     f' @{str(datetime.datetime.now())[:-3]} ({temp_repr})\nSpecified save_dir: "{self.save_dir}"'
+        for i, name in enumerate(self.names):
+            if i == 0:
+                continue
+            xinfo_bar += f'\n@{i}: {name}'
         print(xinfo_bar)
 
     def summary(self, keys_str: Optional[str] = None) -> None:
@@ -461,11 +608,13 @@ class TvtsVisualization(object):
             'parent\nrecord',
             'init\nweights',
 
+            'epoch',
             'epoch\ncount',
             'save\nexisted/all',
             'save\ndir',
 
-            'from', 'to',
+            'from', 
+            'to',
             'duration',
             'batch\nrecords',
 
@@ -498,7 +647,7 @@ class TvtsVisualization(object):
                 '$sort': {'_id': pm.ASCENDING},
             }
         ]
-        cursor = self.table.aggregate(pipeline)
+        cursor = self.tables[0].aggregate(pipeline)
         pipeline4batch = [
             {
                 '$match': xmatch
@@ -515,7 +664,7 @@ class TvtsVisualization(object):
                 '$sort': {'_id': pm.ASCENDING},
             }
         ]
-        cursor4batch = self.table_4batch.aggregate(pipeline4batch)
+        cursor4batch = self.tables_4batch[0].aggregate(pipeline4batch)
 
         # get the batch records count aggregation
         train2batch_cnt_map = {}
@@ -530,7 +679,7 @@ class TvtsVisualization(object):
             count = int(row['batch_count'])
             train2batch_cnt_map[train_id] = count
             xset_train_ids_4batch.add(train_id)
-            cur = self.table_4batch.find({
+            cur = self.tables_4batch[0].find({
                 'train_id': train_id,
             }).sort([
                 ('epoch', pm.DESCENDING),
@@ -573,7 +722,7 @@ class TvtsVisualization(object):
             n_rows += 1
             train_id = int(row['_id'])
             count = int(row['epoch_count'])
-            cur = self.table.find({
+            cur = self.tables[0].find({
                 'train_id': train_id,
             }).sort('epoch', pm.DESCENDING)
 
@@ -603,7 +752,7 @@ class TvtsVisualization(object):
                 if save_rel_path:
                     count_path += 1
                     abs_path = os.path.join(save_dir, save_rel_path)
-                    if os.path.exists(abs_path):
+                    if is_exist(abs_path, self.service_host, self.service_port):
                         count_path_exists += 1
 
             for k in keys_str:
@@ -628,9 +777,10 @@ class TvtsVisualization(object):
             t.add_row([
                 "Y" if last_row.get("is_temp", 0) else "",
                 train_id,
-                f'{last_row.get("parent_id", 0)}-{last_row.get("parent_epoch", 0)}',
+                f'{last_row.get("parent_id", 0)}-{last_row.get("parent_epoch", 0.0)}',
                 long_text_to_block(str(last_row.get('init_weights', '')), LONG_TEXT_WIDTH_OF_COLUMN),
 
+                f'{first_row["epoch"]} ~ {last_row["epoch"]}',
                 count,
                 f'{count_path_exists}/{count_path}',
                 long_text_to_block(str(last_row.get('save_dir', '')), LONG_TEXT_WIDTH_OF_COLUMN),
@@ -642,7 +792,7 @@ class TvtsVisualization(object):
 
                 *xvalues_list,
 
-                long_text_to_block(str(last_row.get('memo', '')), LONG_TEXT_WIDTH_OF_COLUMN),
+                long_text_to_block(str(first_row.get('memo', '')), LONG_TEXT_WIDTH_OF_COLUMN),
             ])
             xset_train_ids.add(train_id)
             if n_rows and 0 == n_rows % 5:
@@ -677,9 +827,10 @@ class TvtsVisualization(object):
                 xlist = [
                     "Y" if last_row.get("is_temp", 0) else "",
                     f'{train_id}(batch only)',
-                    f'{last_row.get("parent_id", 0)}-{last_row.get("parent_epoch", 0)}',
+                    f'{last_row.get("parent_id", 0)}-{last_row.get("parent_epoch", 0.0)}',
                     long_text_to_block(str(last_row.get('init_weights', '')), LONG_TEXT_WIDTH_OF_COLUMN),
 
+                    ' ',
                     epoch_count,
                     ' ',
                     long_text_to_block(str(last_row.get('save_dir', '')), LONG_TEXT_WIDTH_OF_COLUMN),
@@ -703,200 +854,101 @@ class TvtsVisualization(object):
 
         print(t.draw())
 
+    plot_4batch_alpha = 0.6
+
     def plot_4batch(
             self,
             xtrain_id=1,
             xmetrics_groups='cost',
-            xhyper=None,
-            xepoch_range='0:0'
+            xm_hyper=None,
+            xepoch_range='0:0',
+            xbatch_range='0:0',  # TODO
     ) -> None:
+        # validate parameters
         assert isinstance(xtrain_id, int)
         assert isinstance(xmetrics_groups, str)
-        if xhyper is not None:
-            assert isinstance(xhyper, str)
+        if xm_hyper is not None:
+            assert isinstance(xm_hyper, str)
         assert isinstance(xepoch_range, str)
 
-        xepoch_begin, xepoch_end = xepoch_range.split(':')
-        xepoch_begin = int(xepoch_begin)
-        xepoch_end = int(xepoch_end)
+        try:
+            xepoch_begin, xepoch_end = xepoch_range.split(':')
+            xepoch_begin = float(xepoch_begin)
+            xepoch_end = float(xepoch_end)
+        except Exception as ex:
+            print(traceback.format_exc())
+        
+        assert xepoch_begin >= 0.
+        assert xepoch_end >= 0.
+        if xepoch_begin + xepoch_end > 0 and xepoch_end:
+            assert xepoch_begin < xepoch_end
+
+        try:
+            xbatch_begin, xbatch_end = xbatch_range.split(':')
+            xbatch_begin = int(xbatch_begin)
+            xbatch_end = int(xbatch_end)
+        except Exception as ex:
+            print(traceback.format_exc())
+            
+        assert xbatch_begin >= 0
+        assert xbatch_end >= 0
+        if xbatch_begin + xbatch_end > 0 and xbatch_end:
+            assert xbatch_begin < xbatch_end
+        
+        if xepoch_begin + xepoch_end > 0 and xbatch_begin + xbatch_end > 0:
+            raise f'You cannot set epoch range and batch range at the same time!'
 
         # parse metrics groups
         xmetrics_groups = xmetrics_groups.split(',')
-        groups = []
+        xm_name_idxs = []  # 0|1,0|0
+        xm_train_ids = []  # 4|3,4|4
+        xm_groups = []  # key1|key2,key3|key4
+        xm_groups_with_idx_and_id = []  # key1@0-7|key2@1-5,key3@0-7|key4@1-5
         for group in xmetrics_groups:
-            groups.append(group.split('|'))
-        n_groups = len(groups)
-        keys = []
-        for group in groups:
-            keys.extend(group)
-        if xhyper is not None:
-            keys.append(xhyper)
-
-        def apply_restrictions(xc_query):
-            if not xepoch_begin and not xepoch_end:
-                return
-            xcdict = {}
-            if xepoch_begin:
-                xcdict['$gte'] = xepoch_begin
-            if xepoch_end:
-                xcdict['$lte'] = xepoch_end
-            xc_query['epoch'] = xcdict
-
-        query = {
-            'train_id': xtrain_id,
-            'global_batch': {
-                '$ne': None
-            }
-        }
-        apply_restrictions(query)
-        cursor = self.table_4batch.find(query).sort([
-            ('global_batch', pm.ASCENDING),
-        ])
-
-        # fetch the plot values
-        cnt = 0
-        rows_list = []
-        for row in cursor:
-            cnt += 1
-            rows_list.append(row)
-
-        # no global batch number available, translate local batch number
-        is_global = True
-        if cnt <= 0:
-            is_global = False
-            query = {
-                'train_id': xtrain_id,
-            }
-            apply_restrictions(query)
-            cursor = self.table_4batch.find(query).sort([
-                ('epoch', pm.ASCENDING),
-                ('batch', pm.ASCENDING),
-            ])
-
-            # base of each epoch is an accumulated value
-            epoch_count_map, epoch_base_map = {}, {}
-            epoch_list = []
-            rows_list = []
-            for row in cursor:
-                xepoch = int(row['epoch'])
-                rows_list.append(row)
-                cnt = epoch_count_map.get(xepoch, None)
-                if cnt is None:
-                    epoch_count_map[xepoch] = 0
-                    epoch_list.append(xepoch)
-                    epoch_base_map[xepoch] = 0
-                epoch_count_map[xepoch] += 1
-            for i, xepoch in enumerate(epoch_list[:-1]):
-                base = epoch_count_map[xepoch]
-                for impacted_epoch in epoch_list[i + 1:]:
-                    epoch_base_map[impacted_epoch] += base
-
-        if len(rows_list) <= 0:
-            print(f'> Error: find no batch record with train_id {xtrain_id}!')
-            return
-
-        # fetch the plot values
-        epoch_bar_epoch2x_map = {}
-        x_map, y_map = {}, {}
-        for k in keys:
-            y_map[k] = []
-            x_map[k] = []
-        xlast_epoch = 0
-        for row in rows_list:
-            xepoch = int(row['epoch'])
-            if is_global:
-                x = int(row['global_batch'])
-            else:
-                base = int(epoch_base_map[xepoch])
-                x = int(row['batch']) + base
-            if xepoch > xlast_epoch:
-                epoch_bar_epoch2x_map[xepoch] = x
-            xlast_epoch = xepoch
-            for k in keys:
-                v = row.get(k, None)
-                if v is None:
-                    continue
-                v = float(v)
-                y_map[k].append(v)
-                x_map[k].append(x)
-
-        # plot them
-        spr = 1
-        spc = n_groups
-        spn = 0
-        fig = plt.figure(figsize=[5 * n_groups, 5])
-        plt.subplots_adjust(wspace=0.4)
-        epoch_bars = epoch_bar_epoch2x_map.keys()
-        n_epoch_bars = len(epoch_bars)
-        for group in groups:
-            spn += 1
-            ax2 = plt.subplot(spr, spc, spn)
-            ax1 = ax2.twinx()
-            ax2.set_ylabel(xhyper)
-            ax1.set_title(f'{self.name}@{self.host}:{self.port}\n#{xtrain_id} {group}')
-
-            if xhyper is not None:
-                ax2.plot(x_map[xhyper], y_map[xhyper], color='black')
-
-            for k in group:
-                ax1.plot(x_map[k], y_map[k], label=k, linewidth=1, alpha=0.7)
-
-            # separator of different epochs
-            if n_epoch_bars <= 5:
-                y_min, y_max = ax1.get_ylim()
-                for xi_epoch in epoch_bars:
-                    x = epoch_bar_epoch2x_map[xi_epoch]
-                    ax1.plot([x, x], (y_min, y_max), color='blue')
-                    ax1.annotate(f'#e{xi_epoch}', xy=[x, y_max], color='blue')
-
-            ax1.legend()
-            ax1.grid()
-        print('> Check and close the plotting window to continue ...')
-        plt.show()
-
-    def plot(
-            self,
-            xm_train_id: Optional[int] = 1,
-            xm_metrics_groups: Optional[str] = 'cost',
-            xm_since_train_id: Optional[int] = 0,
-            xm_hyper: Optional[str] = None
-    ) -> None:
-        """
-        Plot the train with xm_train_id and its ancestors showing specified metrics and hyper params
-        from the train with id of xm_since_train_id
-        or from the eldest ancestor if the xm_since_train_id is 0.
-
-        :param xm_train_id: The id of the train to plot.
-        :param xm_metrics_groups: The metrics groups specifier. Eg. "cost|cost_val,acc|acc_val|f1|f1_val"
-        :param xm_since_train_id: If the xm_since_train_id > 0, consider this as the root ancestor's train_id.
-        :param xm_hyper: The hyper param to check. Eg. "lr"
-        :return: void
-        """
-        assert isinstance(xm_train_id, int)
-        assert isinstance(xm_metrics_groups, str)
-        assert isinstance(xm_since_train_id, int)
-        if xm_hyper is not None:
-            assert isinstance(xm_hyper, str)
-
-        # get xm_since_train_id
-        if xm_since_train_id:
-            xm_since_train_id = int(xm_since_train_id)
-            if xm_since_train_id < 0:
-                xm_since_train_id = 0
-
-        # get xm_metrics_groups
-        xm_metrics_groups = xm_metrics_groups.split(',')
-        xm_groups = []
-        for group in xm_metrics_groups:
-            xm_groups.append(group.split('|'))
+            name_idxs = []
+            ids = []
+            keys = []
+            keys_with_idx_and_id = group.split('|')
+            for i, xstr in enumerate(keys_with_idx_and_id):
+                xlist = xstr.split('@')
+                xlen = len(xlist)
+                
+                xname_idx = 0
+                xid = xtrain_id
+                xkey = xstr
+                if xlen == 1:
+                    keys_with_idx_and_id[i] = f'{xstr}@{xname_idx}-{xid}'
+                elif xlen == 2:
+                    xstr, name_and_id = xlist
+                    xkey = xstr
+                    try:
+                        xname_idx, xid = name_and_id.split('-')
+                        xname_idx = int(xname_idx)
+                        xid = int(xid)
+                    except:
+                        raise Exception(f'Format of name and id is not right in "@{name_and_id}"')
+                else:
+                    raise Exception(f'Only 1 @ allowed in "{xstr}"')
+                
+                name_idxs.append(xname_idx)
+                ids.append(xid)
+                keys.append(xkey)
+                
+            xm_name_idxs.append(name_idxs)
+            xm_train_ids.append(ids)
+            xm_groups.append(keys)
+            xm_groups_with_idx_and_id.append(keys_with_idx_and_id)
         xm_n_groups = len(xm_groups)
+        
+        # what data to fetch for each row
         xm_keys = []
         for group in xm_groups:
             xm_keys.extend(group)
         if xm_hyper is not None:
             xm_keys.append(xm_hyper)
-
-        def find_record(xc_train_id, xc_up_to_epoch=0):
+        xm_keys = sorted(set(xm_keys))  # sigularization    
+            
+        def find_record(xc_name_idx, xc_train_id, xc_up_to_epoch=0):
             """
             Enclosure method.
             Find records of training with id of xc_train_id up to epoch of xc_up_to_epoch.
@@ -905,6 +957,438 @@ class TvtsVisualization(object):
             :param xc_up_to_epoch: Up to this epoch.
             :return: dict or None
             """
+            print(f'**** find_record(xc_name_idx={xc_name_idx}, xc_train_id={xc_train_id}, xc_up_to_epoch={xc_up_to_epoch}')
+
+            # get cursor from db
+            xc_key2y_map, xc_key2x_map = {}, {}
+            xc_key2glb_x_map = {}
+
+            query = {
+                'train_id': xc_train_id,
+            }
+            if xc_up_to_epoch:
+                query['epoch'] = {
+                    '$lte': xc_up_to_epoch
+                }
+            cursor = self.tables_4batch[xc_name_idx].find(query).sort([
+                ('epoch', pm.ASCENDING),
+                ('batch', pm.ASCENDING)
+            ])
+
+            # init containers
+            for k in xm_keys:
+                xc_key2y_map[k] = []
+                xc_key2x_map[k] = []
+                xc_key2glb_x_map[k] = []
+
+            # get data from cursor
+            count = 0
+            for i, row in enumerate(cursor):
+                count += 1
+                xi_epoch = float(row['epoch'])
+                for k in xm_keys:
+                    v = row.get(k, None)
+                    if v is None:
+                        continue
+                    xc_key2y_map[k].append(v)
+                    xc_key2x_map[k].append(xi_epoch)  # useless
+                    xc_key2glb_x_map[k].append(xi_epoch)  # will be revised later
+
+            # if no data found
+            if count == 0:
+                return None
+
+            xc_last_row = row
+
+            # the dict to return
+            xc_map = {
+                'key2y_map': xc_key2y_map,
+                'key2x_map': xc_key2x_map,  # useless
+                'key2glb_x_map': xc_key2glb_x_map,  # will be revised later
+                'key2glb_epoch_map': copy.deepcopy(xc_key2glb_x_map),  # will be revised later
+                'train_id': xc_train_id,
+                'up_to_epoch': float(xc_last_row['epoch']),
+                'parent_id': int(xc_last_row.get('parent_id', 0)),
+                'parent_epoch': float(xc_last_row.get('parent_epoch', 0.0)),
+                'base_epoch': 0,
+            }
+            return xc_map
+
+        # fetch data
+        xm_key2glb_epoch_map_list_list, xm_key2glb_x_map_list_list, xm_key2y_map_list_list, = [], [], [], 
+        xm_list_train_ids_show_list_list = []
+        xm_train_id2map_map_list_list = []
+        xcache = {}
+        for iiii, idxs in enumerate(xm_name_idxs):
+            xm_key2glb_epoch_map_list, xm_key2glb_x_map_list, xm_key2y_map_list, = [], [], [], 
+            xm_list_train_ids_show_list = []
+            xm_train_id2map_map_list = []
+            for jjjj, xi_the_id in enumerate(xm_train_ids[iiii]):
+                idx = idxs[jjjj]    
+                xtuple = (idx, xi_the_id)
+                if xtuple in xcache:
+                    print(f'**** Hit cache: {xtuple}')
+                    xm_key2glb_epoch_map_final,\
+                        xm_key2glb_x_map_final,\
+                        xm_key2y_map_final,\
+                        xm_list_train_ids_show_final,\
+                        xm_train_id2map_map_final, = xcache[xtuple]
+                else:
+                
+                    # recursively get data of ancestor trainings
+                    xm_train_id2map_map = {}
+                    xm_set_train_ids, xm_list_train_ids = set(), []
+                    xi_train_id = xi_the_id
+                    xi_up_to_epoch = 0
+                    while True:
+                        if xi_train_id in xm_set_train_ids:
+                            raise TvtsException(f'Error: loop back! {xm_list_train_ids} meet {xi_train_id}')
+                        xm_set_train_ids.add(xi_train_id)
+                        xm_list_train_ids.append(xi_train_id)
+                        xi_map = find_record(idx, xi_train_id, xi_up_to_epoch)
+                        if xi_map is None:
+                            print(f'> Error: find no record with train_id {xi_train_id} !')
+                            return
+                        xm_train_id2map_map[xi_train_id] = xi_map
+                        xi_train_id = int(xi_map.get('parent_id', 0))
+                        xi_up_to_epoch = float(xi_map.get('parent_epoch', 0.0))
+                        if not xi_train_id:  # if it is the eldest ancestor
+                            break
+                    # order by datetime
+                    xm_list_train_ids = xm_list_train_ids[::-1]
+
+                    # build global epoch numbers
+                    xm_list_global_entries = ['key2glb_epoch_map', ]
+                    xm_n_train_ids = len(xm_list_train_ids)
+                    for i, xi_train_id in enumerate(xm_list_train_ids[:-1]):
+                        xi_map = xm_train_id2map_map[xi_train_id]
+                        xi_last_epoch_loaded = xi_map['up_to_epoch']
+                        for j in range(i + 1, xm_n_train_ids):
+                            xj_train_id = xm_list_train_ids[j]
+                            xj_map = xm_train_id2map_map[xj_train_id]
+                            xj_map['base_epoch'] += xi_last_epoch_loaded
+                            for entry in xm_list_global_entries:
+                                for k in xm_keys:
+                                    v = xj_map[entry].get(k, None)
+                                    if v is None:
+                                        continue
+                                    for ii, _ in enumerate(xj_map[entry][k]):
+                                        xj_map[entry][k][ii] += xi_last_epoch_loaded
+
+                    # build global batch numbers
+                    xm_list_global_entries = ['key2glb_x_map', ]
+                    i_glb_batch_base = 0
+                    for i, xi_train_id in enumerate(xm_list_train_ids):
+                        xi_map = xm_train_id2map_map[xi_train_id]
+                        for entry in xm_list_global_entries:
+                            for k in xm_keys:
+                                i_glb_batch = i_glb_batch_base
+                                v = xi_map[entry].get(k, None)
+                                if v is None:
+                                    continue
+                                for ii, _ in enumerate(xi_map[entry][k]):
+                                    i_glb_batch += 1
+                                    xi_map[entry][k][ii] = i_glb_batch
+                        i_glb_batch_base = i_glb_batch
+                        
+                    # Make data for finally plotting
+                    xm_key2glb_epoch_map, xm_key2glb_x_map, xm_key2y_map, xm_key2id_map = {}, {}, {}, {}
+                    for k in xm_keys:
+                        xm_key2glb_epoch_map[k] = []
+                        xm_key2glb_x_map[k] = []
+                        xm_key2y_map[k] = []
+                        xm_key2id_map[k] = []
+
+                    xm_list_train_ids_show = copy.deepcopy(xm_list_train_ids)
+
+                    for xi_train_id in xm_list_train_ids_show:
+                        xi_map = xm_train_id2map_map[xi_train_id]
+                        for k in xm_keys:
+                            xm_key2glb_epoch_map[k].extend(xi_map['key2glb_epoch_map'][k])
+                            xm_key2glb_x_map[k].extend(xi_map['key2glb_x_map'][k])
+                            xm_key2y_map[k].extend(xi_map['key2y_map'][k])
+                            xm_key2id_map[k].extend([xi_train_id] * len(xi_map['key2glb_x_map'][k]))
+                    
+                    # epoch range
+                    if xepoch_begin + xepoch_end == 0:
+                        xm_key2glb_epoch_map_final, xm_key2glb_x_map_final, xm_key2y_map_final, = xm_key2glb_epoch_map, xm_key2glb_x_map, xm_key2y_map
+                        xm_key2id_map_final = xm_key2id_map
+                        xm_list_train_ids_show_final = xm_list_train_ids_show
+                        xm_train_id2map_map_final = xm_train_id2map_map
+                    else:
+                        if not xepoch_begin:
+                            xepoch_begin = -math.inf
+                        if not xepoch_end:
+                            xepoch_end = math.inf
+                        xm_key2glb_epoch_map_final, xm_key2glb_x_map_final, xm_key2y_map_final, = {}, {}, {}, 
+                        xm_key2id_map_final = {}
+                        xm_train_id2map_map_final = {}
+                        xm_set_train_ids_show_final = set()
+                        for k in xm_keys:
+                            xm_key2glb_epoch_map_final[k] = []
+                            xm_key2glb_x_map_final[k] = []
+                            xm_key2y_map_final[k] = []
+                            xm_key2id_map_final[k] = []
+                            for o, xi_epoch in enumerate(xm_key2glb_epoch_map[k]):
+                                if xepoch_begin <= xi_epoch <= xepoch_end:
+                                    xm_key2glb_epoch_map_final[k].append(xi_epoch)
+                                    xm_key2glb_x_map_final[k].append(xm_key2glb_x_map[k][o])
+                                    xm_key2y_map_final[k].append(xm_key2y_map[k][o])
+                                    xi_id = xm_key2id_map[k][o]
+                                    xm_set_train_ids_show_final.add(xi_id)
+                                    xm_key2id_map_final[k].append(xi_id)
+                        
+                        xm_list_train_ids_show_final = sorted(xm_set_train_ids_show_final)
+                        
+                        for xi_id in sorted(xm_list_train_ids_show_final):
+                            xm_train_id2map_map_final[xi_id] = {}
+                            for kkkk, vvvv in xm_train_id2map_map[xi_id].items():
+                                key_prefix = "key2"
+                                if kkkk[:len(key_prefix)] != key_prefix:
+                                    xm_train_id2map_map_final[xi_id][kkkk] = copy.deepcopy(vvvv)
+                                else:
+                                    xm_train_id2map_map_final[xi_id][kkkk] = {}
+                                    for k in xm_keys:
+                                        xm_train_id2map_map_final[xi_id][kkkk][k] = []
+                                        for o, xi_epoch in enumerate(xm_train_id2map_map[xi_id]['key2glb_epoch_map'][k]):
+                                            if xepoch_begin <= xi_epoch <= xepoch_end:
+                                                xm_train_id2map_map_final[xi_id][kkkk][k].append(vvvv[k][o])
+                                                
+                    # batch range
+                    # Note: "epoch range" and "batch range" are exclusive due to the "validation of parameters"
+                    if xbatch_begin + xbatch_end == 0:
+                        xm_key2glb_batch_map_final, xm_key2glb_x_map_final, xm_key2y_map_final, = xm_key2glb_x_map, xm_key2glb_x_map, xm_key2y_map
+                        xm_key2id_map_final = xm_key2id_map
+                        xm_list_train_ids_show_final = xm_list_train_ids_show
+                        xm_train_id2map_map_final = xm_train_id2map_map
+                    else:
+                        if not xbatch_begin:
+                            xbatch_begin = -math.inf
+                        if not xbatch_end:
+                            xbatch_end = math.inf
+                        xm_key2glb_batch_map_final, xm_key2glb_x_map_final, xm_key2y_map_final, = {}, {}, {}, 
+                        xm_key2id_map_final = {}
+                        xm_train_id2map_map_final = {}
+                        xm_set_train_ids_show_final = set()
+                        for k in xm_keys:
+                            xm_key2glb_batch_map_final[k] = []
+                            xm_key2glb_x_map_final[k] = []
+                            xm_key2y_map_final[k] = []
+                            xm_key2id_map_final[k] = []
+                            for o, xi_batch in enumerate(xm_key2glb_x_map[k]):
+                                if xbatch_begin <= xi_batch <= xbatch_end:
+                                    xm_key2glb_batch_map_final[k].append(xi_batch)
+                                    xm_key2glb_x_map_final[k].append(xm_key2glb_x_map[k][o])
+                                    xm_key2y_map_final[k].append(xm_key2y_map[k][o])
+                                    xi_id = xm_key2id_map[k][o]
+                                    xm_set_train_ids_show_final.add(xi_id)
+                                    xm_key2id_map_final[k].append(xi_id)
+                        
+                        xm_list_train_ids_show_final = sorted(xm_set_train_ids_show_final)
+                        
+                        for xi_id in sorted(xm_list_train_ids_show_final):
+                            xm_train_id2map_map_final[xi_id] = {}
+                            for kkkk, vvvv in xm_train_id2map_map[xi_id].items():
+                                key_prefix = "key2"
+                                if kkkk[:len(key_prefix)] != key_prefix:
+                                    xm_train_id2map_map_final[xi_id][kkkk] = copy.deepcopy(vvvv)
+                                else:
+                                    xm_train_id2map_map_final[xi_id][kkkk] = {}
+                                    for k in xm_keys:
+                                        xm_train_id2map_map_final[xi_id][kkkk][k] = []
+                                        for o, xi_batch in enumerate(xm_train_id2map_map[xi_id]['key2glb_x_map'][k]):
+                                            if xbatch_begin <= xi_batch <= xbatch_end:
+                                                xm_train_id2map_map_final[xi_id][kkkk][k].append(vvvv[k][o])
+                                    
+                    xcache[xtuple] = [
+                        copy.deepcopy(xm_key2glb_epoch_map_final),
+                        copy.deepcopy(xm_key2glb_x_map_final),
+                        copy.deepcopy(xm_key2y_map_final),
+                        copy.deepcopy(xm_list_train_ids_show_final),
+                        copy.deepcopy(xm_train_id2map_map_final),
+                    ]
+                            
+                # accumulate a group
+                xm_key2glb_epoch_map_list.append(xm_key2glb_epoch_map_final)
+                xm_key2glb_x_map_list.append(xm_key2glb_x_map_final)
+                xm_key2y_map_list.append(xm_key2y_map_final)
+                
+                xm_list_train_ids_show_list.append(xm_list_train_ids_show_final)
+                xm_train_id2map_map_list.append(xm_train_id2map_map_final)
+                
+            # accumulate all the groups
+            xm_key2glb_epoch_map_list_list.append(xm_key2glb_epoch_map_list)
+            xm_key2glb_x_map_list_list.append(xm_key2glb_x_map_list)
+            xm_key2y_map_list_list.append(xm_key2y_map_list)
+            
+            xm_list_train_ids_show_list_list.append(xm_list_train_ids_show_list)
+            xm_train_id2map_map_list_list.append(xm_train_id2map_map_list)
+
+        # finally plot them
+        spr = 1
+        spc = xm_n_groups
+        spn = 0
+        fig = plt.figure(figsize=[5*xm_n_groups, 5])
+        plt.subplots_adjust(wspace=0.4, top=0.8)
+
+        for i, group in enumerate(xm_groups):
+            spn += 1
+            xi_ax2 = plt.subplot(spr, spc, spn)
+            xi_ax1 = xi_ax2.twinx()
+
+            xi_ax2.set_ylabel(xm_hyper)
+            xi_ax1.set_title(f'{self.names[0]}@{self.host}:{self.port}\n{xm_groups_with_idx_and_id[i]}')
+
+            # plot
+            hyper_set = set()
+            vertical_set = set()
+            for j, k in enumerate(group):
+                
+                # the metrics curves
+                x = xm_key2glb_x_map_list_list[i][j][k]
+                x = np.array(x, dtype=float)
+                y = xm_key2y_map_list_list[i][j][k]
+                    
+                # plot hyper param
+                if xm_hyper is not None:
+                    xtuple = (xm_name_idxs[i][j], xm_train_ids[i][j], )
+                    if xtuple not in hyper_set:
+                        xi_ax2.plot(x, xm_key2y_map_list_list[i][j][xm_hyper], alpha=TvtsVisualization.plot_4batch_alpha, label=f'{xm_hyper}@{xm_name_idxs[i][j]}-{xm_train_ids[i][j]}')
+                        hyper_set.add(xtuple)
+                
+                    
+                xline, = xi_ax1.plot(x, y, label=xm_groups_with_idx_and_id[i][j], linewidth=1, alpha=TvtsVisualization.plot_4batch_alpha)
+                xcolor = xline.get_color()
+
+                # separator vertical line for ancestor trainings
+                for xi_train_id in xm_list_train_ids_show_list_list[i][j]:
+                    xtuple = (xm_name_idxs[i][j], xi_train_id, )
+                    if xtuple in vertical_set:
+                        continue
+                    xi_map = xm_train_id2map_map_list_list[i][j][xi_train_id]
+                    y_min, y_max = xi_ax1.get_ylim()
+                    base = min(xi_map['key2glb_x_map'][k])
+                    xi_ax1.plot([base, base], [y_min, y_max], color=xcolor, alpha=TvtsVisualization.plot_4batch_alpha)
+                    annot = f'#id@{xm_name_idxs[i][j]}-{xi_train_id}(glb_{base})'
+                    xi_ax1.annotate(annot, xy=[base, y_min], color='black', alpha=TvtsVisualization.plot_4batch_alpha)
+                    vertical_set.add(xtuple)
+
+            xi_ax1.legend()
+            xi_ax1.grid()
+            xi_ax1.set_xlabel('Global Epoch')
+            xi_ax2.legend()
+
+        # show the plot window
+        print('> Check and close the plotting window to continue ...')
+        plt.show()
+        
+
+    decorator_shift_regexp = re.compile(r'([^\-\+]+)([-+])([^\-\+]+)')
+    shift_categories_set = set(['-', '+', '0'])
+    plot_alpha = 0.7
+
+    def plot(
+            self,
+            xm_train_id: Optional[int] = 1,
+            xm_metrics_groups: Optional[str] = 'cost',
+            xm_hyper: Optional[str] = None
+    ) -> None:
+        """
+        Plot the train with xm_train_id and its ancestors showing specified metrics and hyper params.
+
+        :param xm_train_id: The id of the train to plot.
+        :param xm_metrics_groups: The metrics groups specifier. Eg. "cost|cost_val,acc|acc_val|f1|f1_val"
+        :param xm_hyper: The hyper param to check. Eg. "lr"
+        :return: void
+        """
+        assert isinstance(xm_train_id, int)
+        assert isinstance(xm_metrics_groups, str)
+        if xm_hyper is not None:
+            assert isinstance(xm_hyper, str)
+
+        # get xm_metrics_groups
+        xm_metrics_groups = xm_metrics_groups.split(',')
+        xm_name_idxs = []  # 0|1,0|0
+        xm_train_ids = []  # 4|3,4|4
+        xm_groups = []  # key1|key2,key3|key4
+        xm_groups_decorated = []  # key1-0.5|key2+0.5,key3-0.5|key4+0.5
+        xm_groups_shift_dir = []  # -|0,+|0
+        xm_groups_shift_len = []  # 0.5|0.0,0.5|0.0
+        for group in xm_metrics_groups:
+            keys_decorated = group.split('|')
+            name_idxs = []
+            ids = []
+            keys = []
+            dirs = []  # '-' / '+' / '0'
+            lens = []  # float
+            for i, xstr in enumerate(keys_decorated):
+                
+                xlist = xstr.split('@')
+                xlen = len(xlist)
+                
+                xname_idx = 0
+                xid = xm_train_id
+                if xlen == 1:
+                    keys_decorated[i] = f'{xstr}@{xname_idx}-{xid}'
+                elif xlen == 2:
+                    xstr, name_and_id = xlist
+                    try:
+                        xname_idx, xid = name_and_id.split('-')
+                        xname_idx = int(xname_idx)
+                        xid = int(xid)
+                    except:
+                        raise Exception(f'Format of name and id is not right in "@{name_and_id}"')
+                else:
+                    raise Exception(f'Only 1 @ allowed in "{xstr}"')
+                
+                matches = TvtsVisualization.decorator_shift_regexp.match(xstr)
+                xkey = xstr
+                xdir = '0'
+                xlen = 0.0
+                if matches is not None:
+                    try:
+                        xkey = matches[1]
+                        
+                        xdir = matches[2]
+                        assert xdir in TvtsVisualization.shift_categories_set, f'direction "{xdir}" should be in the set {TvtsVisualization.shift_categories_set}'
+                        
+                        xlen = float(matches[3])
+                    except Exception as ex:
+                        print(ex, file=sys.stderr, flush=True)
+
+                name_idxs.append(xname_idx)
+                ids.append(xid)
+                keys.append(xkey)
+                dirs.append(xdir)
+                lens.append(xlen)
+            
+            xm_name_idxs.append(name_idxs)
+            xm_train_ids.append(ids)
+            xm_groups.append(keys)
+            xm_groups_decorated.append(keys_decorated)
+            xm_groups_shift_dir.append(dirs)
+            xm_groups_shift_len.append(lens)
+            
+        xm_n_groups = len(xm_groups)
+        
+        # what data to fetch for each row
+        xm_keys = []
+        for group in xm_groups:
+            xm_keys.extend(group)
+        if xm_hyper is not None:
+            xm_keys.append(xm_hyper)
+        xm_keys = sorted(set(xm_keys))  # sigularization
+
+        def find_record(xc_name_idx, xc_train_id, xc_up_to_epoch=0):
+            """
+            Enclosure method.
+            Find records of training with id of xc_train_id up to epoch of xc_up_to_epoch.
+
+            :param xc_train_id: The training's id.
+            :param xc_up_to_epoch: Up to this epoch.
+            :return: dict or None
+            """
+            print(f'**** find_record(xc_name_idx={xc_name_idx}, xc_train_id={xc_train_id}, xc_up_to_epoch={xc_up_to_epoch}')
 
             # get cursor from db
             xc_key2y_map, xc_key2x_map = {}, {}
@@ -918,7 +1402,7 @@ class TvtsVisualization(object):
                 query['epoch'] = {
                     '$lte': xc_up_to_epoch
                 }
-            cursor = self.table.find(query).sort('epoch', pm.ASCENDING)
+            cursor = self.tables[xc_name_idx].find(query).sort('epoch', pm.ASCENDING)
 
             # init containers
             for k in xm_keys:
@@ -931,11 +1415,9 @@ class TvtsVisualization(object):
 
             # get data from cursor
             count = 0
-            xc_epoch2row_map = {}
             for i, row in enumerate(cursor):
                 count += 1
-                xi_epoch = int(row['epoch'])
-                xc_epoch2row_map[xi_epoch] = row
+                xi_epoch = float(row['epoch'])
                 for k in xm_keys:
                     v = row.get(k, None)
                     if v is None:
@@ -964,279 +1446,201 @@ class TvtsVisualization(object):
                 'key2x_map_with_save_path': xc_key2x_map_with_save_path,
                 'key2glb_x_map_with_save_path': xc_key2glb_x_map_with_save_path,
                 'train_id': xc_train_id,
-                'up_to_epoch': int(xc_last_row['epoch']),
+                'up_to_epoch': float(xc_last_row['epoch']),
                 'parent_id': int(xc_last_row.get('parent_id', 0)),
-                'parent_epoch': int(xc_last_row.get('parent_epoch', 0)),
+                'parent_epoch': float(xc_last_row.get('parent_epoch', 0.0)),
                 'base_epoch': 0,
-                'epoch2row_map': xc_epoch2row_map,
             }
             return xc_map
 
-        # recursively get data of ancestor trainings
-        xm_train_id2map_map = {}
-        xm_set_train_ids, xm_list_train_ids = set(), []
-        xi_train_id = xm_train_id
-        xi_up_to_epoch = 0
-        while True:
-            if xi_train_id in xm_set_train_ids:
-                raise TvtsException(f'Error: loop back! {xm_list_train_ids} meet {xi_train_id}')
-            xm_set_train_ids.add(xi_train_id)
-            xm_list_train_ids.append(xi_train_id)
-            xi_map = find_record(xi_train_id, xi_up_to_epoch)
-            if xi_map is None:
-                print(f'> Error: find no record with train_id {xi_train_id} !' \
-                      f' If there are only batch records, please add -b to arguments.')
-                return
-            xm_train_id2map_map[xi_train_id] = xi_map
-            xi_train_id = int(xi_map.get('parent_id', 0))
-            xi_up_to_epoch = int(xi_map.get('parent_epoch', 0))
-            if not xi_train_id:  # if it is the eldest ancestor
-                break
-        # order by datetime
-        xm_list_train_ids = xm_list_train_ids[::-1]
+        xm_key2glb_x_map_list_list, xm_key2y_map_list_list, xm_key2glb_x_map_with_save_path_list_list, xm_key2y_map_with_save_path_list_list = [], [], [], []
+        xm_list_train_ids_show_list_list = []
+        xm_train_id2map_map_list_list = []
 
-        # validate ancestors
-        if xm_since_train_id and not xm_since_train_id in xm_set_train_ids:
-            raise TvtsException(f'The training id ({xm_since_train_id}) you specified as "since"' \
-                                f' is not an ancestor of this training ({xm_train_id})!')
+        xcache = {}
 
-        # build global epoch numbers
-        xm_list_global_entries = ['key2glb_x_map', 'key2glb_x_map_with_save_path']
-        xm_n_train_ids = len(xm_list_train_ids)
-        for i, xi_train_id in enumerate(xm_list_train_ids[:-1]):
-            xi_map = xm_train_id2map_map[xi_train_id]
-            xi_last_epoch_loaded = xi_map['up_to_epoch']
-            for j in range(i + 1, xm_n_train_ids):
-                xj_train_id = xm_list_train_ids[j]
-                xj_map = xm_train_id2map_map[xj_train_id]
-                xj_map['base_epoch'] += xi_last_epoch_loaded
-                for entry in xm_list_global_entries:
+        for iiii, idxs in enumerate(xm_name_idxs):
+            
+            xm_key2glb_x_map_list, xm_key2y_map_list, xm_key2glb_x_map_with_save_path_list, xm_key2y_map_with_save_path_list = [], [], [], []
+            xm_list_train_ids_show_list = []
+            xm_train_id2map_map_list = []
+            for jjjj, xi_the_id in enumerate(xm_train_ids[iiii]):
+                idx = idxs[jjjj]    
+                xtuple = (idx, xi_the_id)
+                if xtuple in xcache:
+                    print(f'**** Hit cache: {xtuple}')
+                    xm_key2glb_x_map,\
+                        xm_key2y_map,\
+                        xm_key2glb_x_map_with_save_path,\
+                        xm_key2y_map_with_save_path,\
+                        xm_list_train_ids_show,\
+                        xm_train_id2map_map, = xcache[xtuple]
+                else:
+                
+                    # recursively get data of ancestor trainings
+                    xm_train_id2map_map = {}
+                    xm_set_train_ids, xm_list_train_ids = set(), []
+                    xi_train_id = xi_the_id
+                    xi_up_to_epoch = 0
+                    while True:
+                        if xi_train_id in xm_set_train_ids:
+                            raise TvtsException(f'Error: loop back! {xm_list_train_ids} meet {xi_train_id}')
+                        xm_set_train_ids.add(xi_train_id)
+                        xm_list_train_ids.append(xi_train_id)
+                        xi_map = find_record(idx, xi_train_id, xi_up_to_epoch)
+                        if xi_map is None:
+                            print(f'> Error: find no record with train_id {xi_train_id} !' \
+                                f' If there are only batch records, please add -b to arguments.')
+                            return
+                        xm_train_id2map_map[xi_train_id] = xi_map
+                        xi_train_id = int(xi_map.get('parent_id', 0))
+                        xi_up_to_epoch = float(xi_map.get('parent_epoch', 0.0))
+                        if not xi_train_id:  # if it is the eldest ancestor
+                            break
+                    # order by datetime
+                    xm_list_train_ids = xm_list_train_ids[::-1]
+
+                    # build global epoch numbers
+                    xm_list_global_entries = ['key2glb_x_map', 'key2glb_x_map_with_save_path']
+                    xm_n_train_ids = len(xm_list_train_ids)
+                    for i, xi_train_id in enumerate(xm_list_train_ids[:-1]):
+                        xi_map = xm_train_id2map_map[xi_train_id]
+                        xi_last_epoch_loaded = xi_map['up_to_epoch']
+                        for j in range(i + 1, xm_n_train_ids):
+                            xj_train_id = xm_list_train_ids[j]
+                            xj_map = xm_train_id2map_map[xj_train_id]
+                            xj_map['base_epoch'] += xi_last_epoch_loaded
+                            for entry in xm_list_global_entries:
+                                for k in xm_keys:
+                                    v = xj_map[entry].get(k, None)
+                                    if v is None:
+                                        continue
+                                    for ii, _ in enumerate(xj_map[entry][k]):
+                                        xj_map[entry][k][ii] += xi_last_epoch_loaded
+
+                    # Make data for finally plotting
+                    xm_key2glb_x_map, xm_key2y_map, xm_key2glb_x_map_with_save_path, xm_key2y_map_with_save_path = {}, {}, {}, {}
                     for k in xm_keys:
-                        v = xj_map[entry].get(k, None)
-                        if v is None:
-                            continue
-                        for ii, _ in enumerate(xj_map[entry][k]):
-                            xj_map[entry][k][ii] += xi_last_epoch_loaded
+                        xm_key2glb_x_map[k] = []
+                        xm_key2y_map[k] = []
+                        xm_key2glb_x_map_with_save_path[k] = []
+                        xm_key2y_map_with_save_path[k] = []
 
-        # Make data to finally plot
-        # and apply the "since" training id that user specified
-        xm_key2glb_x_map, xm_key2y_map, xm_key2glb_x_map_with_save_path, xm_key2y_map_with_save_path = {}, {}, {}, {}
-        for k in xm_keys:
-            xm_key2glb_x_map[k] = []
-            xm_key2y_map[k] = []
-            xm_key2glb_x_map_with_save_path[k] = []
-            xm_key2y_map_with_save_path[k] = []
-        if not xm_since_train_id:
-            xm_list_train_ids_show = xm_list_train_ids.copy()
-        else:
-            xm_list_train_ids_show = []
-            start = False
-            for xi_train_id in xm_list_train_ids:
-                if xi_train_id == xm_since_train_id:
-                    start = True
-                if start:
-                    xm_list_train_ids_show.append(xi_train_id)
-        for xi_train_id in xm_list_train_ids_show:
-            xi_map = xm_train_id2map_map[xi_train_id]
-            for k in xm_keys:
-                xm_key2glb_x_map[k].extend(xi_map['key2glb_x_map'][k])
-                xm_key2y_map[k].extend(xi_map['key2y_map'][k])
-                xm_key2glb_x_map_with_save_path[k].extend(xi_map['key2glb_x_map_with_save_path'][k])
-                xm_key2y_map_with_save_path[k].extend(xi_map['key2y_map_with_save_path'][k])
-        n_xm_list_train_ids_show = len(xm_list_train_ids_show)
+                    xm_list_train_ids_show = copy.deepcopy(xm_list_train_ids)
 
-        # plot
-        if n_xm_list_train_ids_show < 1:
-            raise TvtsException(f'Error: n_xm_list_train_ids_show < 1 !')
-        if n_xm_list_train_ids_show == 1:
-            title_epoch = f'#{xm_list_train_ids_show[0]}'
-        else:
-            title_epoch = f'#{xm_list_train_ids_show[0]}~#{xm_list_train_ids_show[-1]}'
-            pass
-        xm_hover_box_width = 20
-        xm_hover_box_xoffset_abs, xm_hover_box_yoffset_abs = 20, 20
+                    for xi_train_id in xm_list_train_ids_show:
+                        xi_map = xm_train_id2map_map[xi_train_id]
+                        for k in xm_keys:
+                            xm_key2glb_x_map[k].extend(xi_map['key2glb_x_map'][k])
+                            xm_key2y_map[k].extend(xi_map['key2y_map'][k])
+                            xm_key2glb_x_map_with_save_path[k].extend(xi_map['key2glb_x_map_with_save_path'][k])
+                            xm_key2y_map_with_save_path[k].extend(xi_map['key2y_map_with_save_path'][k])
+                    
+                    xcache[xtuple] = [
+                        copy.deepcopy(xm_key2glb_x_map),
+                        copy.deepcopy(xm_key2y_map),
+                        copy.deepcopy(xm_key2glb_x_map_with_save_path),
+                        copy.deepcopy(xm_key2y_map_with_save_path),
+                        copy.deepcopy(xm_list_train_ids_show),
+                        copy.deepcopy(xm_train_id2map_map),
+                    ]
+                            
+                # accumulate a group
+                xm_key2glb_x_map_list.append(xm_key2glb_x_map)
+                xm_key2y_map_list.append(xm_key2y_map)
+                xm_key2glb_x_map_with_save_path_list.append(xm_key2glb_x_map_with_save_path)
+                xm_key2y_map_with_save_path_list.append(xm_key2y_map_with_save_path)
+                
+                xm_list_train_ids_show_list.append(xm_list_train_ids_show)
+                xm_train_id2map_map_list.append(xm_train_id2map_map)
+                
+            # accumulate all the groups
+            xm_key2glb_x_map_list_list.append(xm_key2glb_x_map_list)
+            xm_key2y_map_list_list.append(xm_key2y_map_list)
+            xm_key2glb_x_map_with_save_path_list_list.append(xm_key2glb_x_map_with_save_path_list)
+            xm_key2y_map_with_save_path_list_list.append(xm_key2y_map_with_save_path_list)
+            
+            xm_list_train_ids_show_list_list.append(xm_list_train_ids_show_list)
+            xm_train_id2map_map_list_list.append(xm_train_id2map_map_list)
+                
+
         spr = 1
         spc = xm_n_groups
         spn = 0
         fig = plt.figure(figsize=[5*xm_n_groups, 5])
         plt.subplots_adjust(wspace=0.4, top=0.8)
-        xm_list_of_tuple_ax_dots_key = []
-        xm_ax2annot_map = {}
-        for group in xm_groups:
+
+        for i, group in enumerate(xm_groups):
             spn += 1
             xi_ax2 = plt.subplot(spr, spc, spn)
             xi_ax1 = xi_ax2.twinx()
 
             xi_ax2.set_ylabel(xm_hyper)
-            xi_ax1.set_title(f'{self.name}@{self.host}:{self.port}\n{title_epoch} {group}')
+            xi_ax1.set_title(f'{self.names[0]}@{self.host}:{self.port}\n{xm_groups_decorated[i]}')
 
-            # plot hyper param
-            if xm_hyper is not None:
-                xxx, yyy = [], []
-                for xi_train_id in xm_list_train_ids_show:
-                    xi_map = xm_train_id2map_map[xi_train_id]
-                    xxx.extend(xi_map['key2glb_x_map'][xm_hyper])
-                    yyy.extend(xi_map['key2y_map'][xm_hyper])
-                xi_ax2.plot(xxx, yyy, color='black', alpha=0.7, label=xm_hyper)
-
-            # plot metrics
-            for k in group:
-                # the curve
-                dots = xi_ax1.plot(xm_key2glb_x_map[k], xm_key2y_map[k], label=k, linewidth=1, alpha=0.7)
+            # plot
+            hyper_set = set()
+            vertical_set = set()
+            for j, k in enumerate(group):
+                
+                # the metrics curves
+                decorated = xm_groups_decorated[i][j]
+                xdir = xm_groups_shift_dir[i][j]
+                xlen = xm_groups_shift_len[i][j]
+                x = xm_key2glb_x_map_list_list[i][j][k]
+                x = np.array(x, dtype=float)
+                y = xm_key2y_map_list_list[i][j][k]
+                x2 = xm_key2glb_x_map_with_save_path_list_list[i][j][k]
+                x2 = np.array(x2, dtype=float)
+                y2 = xm_key2y_map_with_save_path_list_list[i][j][k]
+                if '-' == xdir:
+                    x -= xlen
+                    x2 -= xlen
+                elif '+' == xdir:
+                    x += xlen
+                    x2 += xlen
+                    
+                # plot hyper param
+                if xm_hyper is not None:
+                    xtuple = (xm_name_idxs[i][j], xm_train_ids[i][j], )
+                    if xtuple not in hyper_set:
+                        xi_ax2.plot(x, xm_key2y_map_list_list[i][j][xm_hyper], alpha=TvtsVisualization.plot_alpha, label=f'{xm_hyper}@{xm_name_idxs[i][j]}-{xm_train_ids[i][j]}')
+                        hyper_set.add(xtuple)
+                
+                    
+                xline, = xi_ax1.plot(x, y, label=decorated, linewidth=1, alpha=TvtsVisualization.plot_alpha)
+                xcolor = xline.get_color()
+                xi_ax1.scatter(
+                    x, 
+                    y,
+                    s=2, color=xcolor, marker='o', alpha=TvtsVisualization.plot_alpha
+                )
                 # the dots representing epoch with saved model or weights
                 xi_ax1.scatter(
-                    xm_key2glb_x_map_with_save_path[k],
-                    xm_key2y_map_with_save_path[k],
-                    s=4, color='black', marker='s', alpha=0.7
+                    x2,
+                    y2,
+                    s=10, color=xcolor, marker='x', alpha=TvtsVisualization.plot_alpha
                 )
-                # collect data for drawing when hovering over the curve
-                dots = dots[0]
-                xm_list_of_tuple_ax_dots_key.append((xi_ax1, dots, k))
 
-            # separator vertical line for ancestor trainings
-            for xi_train_id in xm_list_train_ids_show:
-                xi_map = xm_train_id2map_map[xi_train_id]
-                y_min, y_max = xi_ax1.get_ylim()
-                base = xi_map['base_epoch'] + 1
-                xi_ax1.plot([base, base], [y_min, y_max], color='black', alpha=0.7)
-                xi_ax1.annotate(f'#id_{xi_train_id}(glb_{base})', xy=[base, y_max], color='black', alpha=0.7)
+                # separator vertical line for ancestor trainings
+                for xi_train_id in xm_list_train_ids_show_list_list[i][j]:
+                    xtuple = (xm_name_idxs[i][j], xi_train_id, )
+                    if xtuple in vertical_set:
+                        continue
+                    xi_map = xm_train_id2map_map_list_list[i][j][xi_train_id]
+                    y_min, y_max = xi_ax1.get_ylim()
+                    base = xi_map['base_epoch']
+                    # base = min(xi_map['key2glb_x_map'][k])   # as 4batch, not suitable
+                    xi_ax1.plot([base, base], [y_min, y_max], color=xcolor, alpha=TvtsVisualization.plot_alpha)
+                    annot = f'#id@{xm_name_idxs[i][j]}-{xi_train_id}(glb_{base})'
+                    xi_ax1.annotate(annot, xy=[base, y_min], color='black', alpha=TvtsVisualization.plot_alpha)
+                    vertical_set.add(xtuple)
 
             xi_ax1.legend()
             xi_ax1.grid()
             xi_ax1.set_xlabel('Global Epoch')
             xi_ax2.legend()
 
-            xi_last_base = xm_train_id2map_map[xm_list_train_ids_show[-1]]['base_epoch']
-            xi_2nd_xaxis = xi_ax1.secondary_xaxis(
-                'top',
-                functions=(lambda x: x - xi_last_base, lambda x: x + xi_last_base)
-            )
-            # xi_2nd_xaxis.set_xlabel('Epoch in this turn')
-
-            xi_annot = xi_ax1.annotate(
-                "",
-                xy=(0, 0),
-                xytext=(xm_hover_box_xoffset_abs, xm_hover_box_yoffset_abs),
-                textcoords="offset points",
-                bbox=dict(boxstyle="round", fc="w"),
-                arrowprops=dict(arrowstyle="->"),
-            )
-            xi_annot.set_visible(False)
-            xm_ax2annot_map[id(xi_ax1)] = xi_annot
-
-        def update_annot(xc_index, xc_ax, xc_dots, xc_key):
-            """
-            Enclosure method.
-            Update the hover info box
-
-            :param xc_index: x-index
-            :param xc_ax: hover event from which ax
-            :param xc_dots: hover event from dots of which plot
-            :param xc_key: hover event from plot of which key
-            :return: void
-            """
-
-            # get position
-            xc_index = xc_index["ind"][0]
-            xc_global_epoch = xc_index + 1
-            xc_position = xc_dots.get_xydata()[xc_index]
-            xc_y_val = xc_position[1]
-            xc_y_repr = get_better_repr(xc_y_val)
-
-            # get data from position
-            xc_text = None
-            for xi_train_id in xm_list_train_ids_show[::-1]:
-                xi_map = xm_train_id2map_map[xi_train_id]
-                xi_epoch2row_map = xi_map['epoch2row_map']
-                xi_base_epoch = xi_map['base_epoch']
-                if xc_global_epoch <= xi_base_epoch:
-                    continue
-                xi_local_epoch = xc_global_epoch - xi_base_epoch
-
-                row = xi_epoch2row_map[xi_local_epoch]
-                xi_hyper_val = row[xm_hyper]
-                xi_hyper_repr = get_better_repr(xi_hyper_val)
-                xc_text = f'global epoch={xc_global_epoch}, train_id={xi_train_id}, epoch={xi_local_epoch},' \
-                          f' {xc_key}={xc_y_repr}, {xm_hyper}={xi_hyper_repr}'
-                xc_text = long_text_to_block(xc_text, xm_hover_box_width)
-                break  # just show the first match
-            if xc_text is None:  # no matched data
-                return
-
-            # decide where to put the hover info box
-            xmin, xmax = xc_ax.get_xlim()
-            ymin, ymax = xc_ax.get_ylim()
-            xc_x_mid = (xmin + xmax) / 2
-            xc_y_mid = (ymin + ymax) / 2
-            if xc_global_epoch > xc_x_mid:
-                # right: show at left
-                # print('R')
-                xc_hover_box_xoffset = - xm_hover_box_xoffset_abs
-            else:
-                # left: show at right
-                # print('L')
-                xc_hover_box_xoffset = xm_hover_box_xoffset_abs
-            if xc_y_val > xc_y_mid:
-                # upper: show at lower
-                # print('U')
-                xc_hover_box_yoffset = - xm_hover_box_yoffset_abs
-            else:
-                # lower: show at upper
-                # print('L')
-                xc_hover_box_yoffset = xm_hover_box_yoffset_abs
-
-            # draw the hover info box and show it
-            xc_annot = xm_ax2annot_map[id(xc_ax)]
-            xc_annot.xy = xc_position
-            xc_annot.set_text(xc_text)
-            xc_bbox = xc_annot.get_bbox_patch()
-            xc_bbox.set_facecolor('blue')
-            xc_bbox.set_alpha(0.85)
-            xc_bbox_h, xc_bbox_w = xc_bbox.get_height(), xc_bbox.get_width()
-            if xc_global_epoch > xc_x_mid:
-                if xc_y_val > xc_y_mid:
-                    # right, upper
-                    # print('RU')
-                    xc_hover_box_xoffset -= xc_bbox_w
-                    xc_hover_box_yoffset -= xc_bbox_h
-                else:
-                    # right, lower
-                    # print('RL')
-                    xc_hover_box_xoffset -= xc_bbox_w
-            else:
-                if xc_y_val > xc_y_mid:
-                    # left, upper
-                    # print('LU')
-                    xc_hover_box_yoffset -= xc_bbox_h
-                else:
-                    # left, lower
-                    # print('LL')
-                    pass
-            xc_annot.xyann = (xc_hover_box_xoffset, xc_hover_box_yoffset)
-            xc_annot.set_visible(True)
-
-        def hover(xc_event):
-            """
-            Enclosure callback method.
-            Triggered by mouse hover event.
-
-            :param xc_event: The event from matplotlib UI.
-            :return: void
-            """
-            for ax, sc, key in xm_list_of_tuple_ax_dots_key:
-                if xc_event.inaxes == ax:
-                    cont, ind = sc.contains(xc_event)
-                    if cont:
-                        update_annot(ind, ax, sc, key)
-                        fig.canvas.draw_idle()
-                        break
-                    else:
-                        for annot in xm_ax2annot_map.values():
-                            annot.set_visible(False)
-                        fig.canvas.draw_idle()
-
-        # Bind a callback to mouse hover events
-        fig.canvas.mpl_connect('motion_notify_event', hover)
         # show the plot window
         print('> Check and close the plotting window to continue ...')
         plt.show()
@@ -1279,14 +1683,16 @@ if '__main__' == __name__:
                 super(ArgumentParser, self).error(message)
 
         parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-        parser.add_argument('name', help='name of the training')
+        parser.add_argument('names', help='name of the training', nargs='+')
         parser.add_argument('--temp', help='if only show data that is temporary or not (0/1/-1)', type=int, default=-1)
 
         parser.add_argument('--host', help='host of the mongodb', type=str, default=DEFAULT_HOST)
         parser.add_argument('-p', '--port', help='port of the mongodb', type=int, default=DEFAULT_PORT)
+        parser.add_argument('--link', help='config name of the mongodb', type=str, default=None)
         parser.add_argument('--db', help='name of the db', type=str, default=DEFAULT_DB_NAME)
         parser.add_argument('--prefix', help='prefix of the tables', type=str, default=DEFAULT_TABLE_PREFIX)
-
+        parser.add_argument('--service_host', help='host of the locate service', type=str, default='localhost')
+        parser.add_argument('--service_port', help='port of the locate service', type=int, default=DEFAULT_LOCATE_SERVICE_PORT)
         parser.add_argument('--save_dir', help='save dir of the save_rel_path', type=str, default=None)
 
         parser.add_argument('--hyper', help='the default hyper param to check', type=str, default='lr')
@@ -1313,7 +1719,7 @@ if '__main__' == __name__:
 
         args = parser.parse_args()
 
-        name = args.name
+        name = args.names
         temp_value = args.temp
         if -1 == temp_value:
             temp_arg = None
@@ -1322,8 +1728,20 @@ if '__main__' == __name__:
 
         host = args.host
         port = args.port
+        link = args.link
+        if link is not None:
+            client = conn(link)
+            host = client.HOST
+            port = client.PORT
+        else:
+            client = None
+            link = None
+        
         db = args.db
         prefix = args.prefix
+
+        service_host = args.service_host
+        service_port = args.service_port
 
         save_dir = args.save_dir
 
@@ -1332,39 +1750,44 @@ if '__main__' == __name__:
         keys = args.keys
         metrics_groups_4batch = args.batch_metrics
 
-        tvtsv = TvtsVisualization(name, temp_arg, host, port, db, prefix, save_dir)
+        if client is not None:
+            tvtsv = TvtsVisualization(
+                name, temp_arg, host, port, db, prefix, save_dir, 
+                client=client, 
+                service_host=service_host, service_port=service_port,
+            )
+        else:
+            tvtsv = TvtsVisualization(
+                name, temp_arg, host, port, db, prefix, save_dir, 
+                service_host=service_host, service_port=service_port,
+            )
 
         def plot_train_id(
                 xtrain_id,
                 xmetrics_groups=metrics_groups,
-                xsince=0,
                 xhyper=None,
                 is_4batch=False,
                 xmetrics_groups_4batch=None,
-                xepoch_range='0:0'
+                xepoch_range='0:0',
+                xbatch_range='0:0',
         ):
             try:
                 xhyper_str = ''
                 if xhyper is not None:
                     xhyper_str = f'with hyper parameter {xhyper}'
                 if not is_4batch:
-                    if xsince:
-                        print(f'> Visualizing training with id of {xtrain_id} from id of {xsince}' \
-                              f' with metrics_groups {xmetrics_groups} {xhyper_str}')
-                    else:
-                        print(f'> Visualizing training with id of {xtrain_id} with' \
-                              f' metrics_groups {xmetrics_groups} {xhyper_str}')
-                    tvtsv.plot(xtrain_id, xmetrics_groups, xsince, xhyper)
+                    print(f'> Visualizing training with id of {xtrain_id} with' \
+                        f' metrics_groups {xmetrics_groups} {xhyper_str}')
+                    tvtsv.plot(xtrain_id, xmetrics_groups, xhyper)
                 else:
-                    print(f'> Visualizing batch records ONLY of training with id of {xtrain_id} with' \
+                    print(f'> Visualizing batch records of training with id of {xtrain_id} with' \
                           f' metrics_groups {xmetrics_groups_4batch} {xhyper_str}')
-                    tvtsv.plot_4batch(xtrain_id, xmetrics_groups_4batch, xhyper, xepoch_range)
+                    tvtsv.plot_4batch(xtrain_id, xmetrics_groups_4batch, xhyper, xepoch_range, xbatch_range)
             except Exception as ex:
-                print(ex)
+                print(traceback.format_exc())
 
         cli_parser = ArgumentParser(prog='Input:')
         cli_parser.add_argument('train_id', help='id of the training you want to check', type=int, nargs='?', default=0)
-        cli_parser.add_argument('-s', '--since', help='since which ancestor id you want to check', type=int, default=0)
         cli_parser.add_argument(
             '-m', '--metrics',
             help='CSV list of metrics groups, each group is vertical bar separated string',
@@ -1380,6 +1803,11 @@ if '__main__' == __name__:
         cli_parser.add_argument(
             '--epoch_range',
             help='the epoch range when check batch records',
+            type=str, default='0:0'
+        )
+        cli_parser.add_argument(
+            '--batch_range',
+            help='the batch range when check batch records',
             type=str, default='0:0'
         )
 
@@ -1452,18 +1880,22 @@ if '__main__' == __name__:
                     if not xtrain_id:
                         print('train_id must be provided!')
                         raise ValueError()
-                    xsince_train_id = xargs.since
+
                     xmetrics_groups = xargs.metrics
                     xhyper = xargs.hyper
                     is_4batch = xargs.batch
                     xmetrics_groups_4batch = xargs.batch_metrics
                     xepoch_range = xargs.epoch_range
-                    return xtrain_id, xmetrics_groups, xsince_train_id, xhyper, is_4batch, xmetrics_groups_4batch, xepoch_range
+                    xbatch_range = xargs.batch_range
+                    return xtrain_id, xmetrics_groups, xhyper, is_4batch, xmetrics_groups_4batch, xepoch_range, xbatch_range
                 except ValueError:
                     print(f'> Invalid input!')
                     return None
             except argparse.ArgumentError as ex:
                 print(f'> Invalid input for argparse!: {ex}')
+                return None
+            except Exception as ex:
+                print(f'Exception: {ex}')
                 return None
 
         def input_value_util_well():
@@ -1484,14 +1916,14 @@ if '__main__' == __name__:
             print(f'> Or: Input "m/bm/hyper/keys=value" to change corresponding keys.')
             print(f'> Or: Input "temp=0/1/-1" to show summary table of only formal data, only temporary data, or all data.')
             print(f'> Or: Input "dir=/path/of/dir/of/saved/weights" to specify save_dir.')
-            print(f'> Or: Do the plotting by CLI command like: [-s SINCE] [-m METRICS(default: {metrics_groups})]' \
+            print(f'> Or: Do the plotting by CLI command like: [-m METRICS(default: {metrics_groups})]' \
                   f' [--batch_metrics BATCH_METRICS(default: {metrics_groups_4batch})]' \
-                  f' [--hyper HYPER=(default: {hyper})] [-b] [--epoch_range(default: 0:0)] train_id')
+                  f' [--hyper HYPER=(default: {hyper})] [-b] [--epoch_range(default: 0:0)] [--batch_range(default: 0:0)] train_id')
             input_list = input_value_util_well()
             if len(input_list) == 0:
                 print('> Bye!')
                 break
-            xx_train_id, xx_metrics_groups, xx_since, xx_hyper, xx_is_4batch, xx_metrics_groups_4batch, xx_epoch_range = input_list
+            xx_train_id, xx_metrics_groups, xx_hyper, xx_is_4batch, xx_metrics_groups_4batch, xx_epoch_range, xx_batch_range = input_list
             if xx_train_id == 0:
                 continue
             if xx_train_id is None:
@@ -1507,11 +1939,11 @@ if '__main__' == __name__:
             plot_train_id(
                 xx_train_id,
                 xx_metrics_groups,
-                xx_since,
                 xx_hyper,
                 xx_is_4batch,
                 xx_metrics_groups_4batch,
-                xx_epoch_range
+                xx_epoch_range,
+                xx_batch_range,
             )
 
     _main()

@@ -9,151 +9,99 @@ from PyCmpltrtok.common_torch import torch_compile, torch_acc_top1, torch_acc_to
 from PyCmpltrtok.common_gpgpu import get_gpu_indexes_from_env
 import tvts.tvts as tvts
 
+VER = 'v1.0'  # version info of this code file
 
 ###############################################################################################################
-# VGG model related (start)
-class ConvBnRelu(torch.nn.Module):
-    """
-    A "Conv - Batch Norm - ReLU" Unit
-    """
-    def __init__(self, in_ch, filters, ksize=(3, 3), strides=(1, 1), padding='same', **kwargs):
-        super().__init__(**kwargs)
-        if padding == 'same':
-            if type(ksize) == tuple:
-                pad = (ksize[0] // 2, ksize[1] // 2)
-            else:
-                pad = ksize // 2
-        else:
-            pad = padding
-        self.conv = torch.nn.Conv2d(in_ch, filters, ksize, strides, pad, bias=False)
-        self.bn = torch.nn.BatchNorm2d(filters)
-        self.relu = torch.nn.ReLU()
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        return x
+# MLP model related (start)
+act_map = {
+    'sigmoid': torch.nn.Sigmoid(),
+    'relu': torch.nn.ReLU(),
+    'tanh': torch.nn.Tanh(),
+}
 
 
-VggD16Conf = [
-    64, 64, 'm',
-    128, 128, 'm',
-    256, 256, 256, 'm',
-    512, 512, 512, 'm',
-    512, 512, 512, 'm',
-    # 'f', -1024, -1024,  # v1.0
-    'f', -1024, 0.5, -1024,  # v2.0 with dropout
-]  # It is almost a standard VGG-D-16 configuration except that I use FC-1024 x2 rather than FC-4096 x2.
+def get_conf(act):
+    mlp_conf = [
+        [256, act],
+        [256, act],
+        [10, None],
+    ]
+    return mlp_conf
 
 
-class VGG(torch.nn.Module):
-    """
-    https://arxiv.org/abs/1409.1556
-    Very Deep Convolutional Networks for Large-Scale Image Recognition
-    by
-    Karen Simonyan, Andrew Zisserman
-    """
-    def __init__(self, n_cls, input_shape=(3, 224, 224), conf=VggD16Conf, **kwargs):
-        """
+class MLP(torch.nn.Module):
 
-        :param n_cls: Number of classes.
-        :param input_shape: Input shape tuple in format (C, H, W)
-        :param conf: List of below elements: ( See VggD16Conf as an example )
-            Positive integer for ConvBnRelu 3x3/1 with that many filters.
-            Negative integer for that many neuron's fully connected layer.
-            Positive fraction for that many proportion's dropout.
-            Letter m for MaxPool/2.
-            Letter f for Flatten.
-        :param kwargs: Other args.
-        """
+    def __init__(self, conf, **kwargs):
         super().__init__(**kwargs)
         layers = []
-        in_ch, in_h, in_w = input_shape
+        input_shape = 28 * 28
         for conf_el in conf:
-            if 'm' == conf_el:
-                layers.append(torch.nn.MaxPool2d(2, 2, 0))
-                in_h //= 2
-                in_w //= 2
-            elif 'f' == conf_el:
-                layers.append(torch.nn.Flatten())
-                in_ch = in_h * in_w * in_ch
-            elif isinstance(conf_el, int):
-                if conf_el > 0:
-                    filters = conf_el
-                    layers.append(ConvBnRelu(in_ch, filters))
-                    in_ch = filters
-                elif conf_el == 0:
-                    raise ValueError("Filter count of conv layer or neuron number of connected layer cannot be zero!")
-                else:
-                    n_neuron = abs(conf_el)
-                    layers.append(torch.nn.Linear(in_ch, n_neuron))
-                    in_ch = n_neuron
-                    layers.append(torch.nn.ReLU())
-            elif isinstance(conf_el, float):
-                layers.append(torch.nn.Dropout(conf_el))
-            else:
-                raise ValueError("Invalid config element {} ".format(conf_el))
-        layers.append(torch.nn.Linear(in_ch, n_cls))
-        layers.append(torch.nn.LogSoftmax(dim=1))
+            n_hidden, act = conf_el
+            layers.append(torch.nn.Linear(input_shape, n_hidden))
+            input_shape = n_hidden
+            if act is not None:
+                layers.append(act_map[act])
         self.seq = torch.nn.Sequential(*layers)
 
     def forward(self, x):
         x = self.seq(x)
         return x
-# VGG model related (end)
+# MLP model related (end)
 ###############################################################################################################
 
 
 if '__main__' == __name__:
     import matplotlib.pyplot as plt
     import argparse
-    import PyCmpltrtok.data.cifar10.load_cifar10 as cifar10
+    import PyCmpltrtok.data.mnist.load_mnist as mnist
     from PyCmpltrtok.auth.mongo.conn import conn as mconn
 
     def _main():
         """ The main program. """
-        sep('VGG16 by PyTorch on Cifar10 with TVTS')
+        sep('MLP by PyTorch on MNIST with TVTS')
 
         ###############################################################################################################
         # Hyper params and switches (start)
         sep('Decide hyper params')
-        VER = 'v3.0'  # version info of this code file
         MEMO = VER  # default memo
-        N_BATCH_SIZE = 256
-        N_EPOCHS = 4
-        LR = 0.001  # default init learning rate
-        GAMMA = 0.98  # default multiplicative factor of learning rate decay per epoch
+        N_BATCH_SIZE = 512
+        N_EPOCHS = 2
+        ACT = 'sigmoid'
+        
+        LR = 0.05  # default init learning rate
+        GAMMA = 0.99  # default multiplicative factor of learning rate decay per epoch
         GAMMA_STRATEGY = 'step'
-        GAMMA_STEP = 32
-        WARMUP = 128
+        GAMMA_STEP = 8
+        WARMUP = 0
         print(f'Default LR={LR}, GAMMA={GAMMA}')
         IS_SPEC_LR = False  # is manually specified the LR
         IS_SPEC_GAMMA = False  # is manually specified the GAMMA
 
         # default dir for saving weights
+        SAVE_FREQ = 5
         BASE_DIR, FILE_NAME = os.path.split(os.path.abspath(__file__))
         SAVE_DIR = os.path.join(BASE_DIR, '_save', FILE_NAME, VER)
 
         # specify or override params from CLI
         parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
         # group #1
-        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_vgg16_torch_cifar10')
+        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_mlp_torch_mnist')
         parser.add_argument('--memo', help='The memo.', type=str, default='(no memo)')
         parser.add_argument('--temp', help='Run as temporary code', action='store_true')
         parser.add_argument('-t', '--test', help='Only run testing phase, no training.', action='store_true')
         # group #2
         parser.add_argument('-n', '--epochs', help='How many epoches to train.', type=int, default=N_EPOCHS)
         parser.add_argument('--batch', help='Batch size.', type=int, default=N_BATCH_SIZE)
+        parser.add_argument('--act', help='activiation type (sigmoid/relu/tanh)', type=str, default=ACT)
         parser.add_argument('--lr', help='Learning rate.', type=float, default=None)
         parser.add_argument('--warmup', help='Warmup step(s) or epoch(s)depending on --gamma-strategy.', type=int, default=WARMUP)
-        parser.add_argument('--gamma', help='Multiplicative factor of learning rate decay per epoch.', type=float, default=None)
+        parser.add_argument('--gamma', help='Multiplicative factor of learning rate decay per epoch.', type=float, default=GAMMA)
         parser.add_argument('--gamma_strategy', help='Step Gamma LR scheduler on step(s) or epoch(s)', type=str, default=GAMMA_STRATEGY)
         parser.add_argument('--gamma_step', help='Step Gamma LR scheduler per --gamma-step steps of step(s) or epoch(s) depending on --gamma-strategy.', type=int, default=GAMMA_STEP)
         # group #3
         parser.add_argument('--pi', help='id of the parent training', type=int, default=0)
         parser.add_argument('--pe', help='parent epoch of the parent training', type=int, default=0)
-        parser.add_argument('--save_freq', help='How many epochs save weights once.', type=int, default=1)
+        parser.add_argument('--save_freq', help='How many epochs save weights once.', type=int, default=SAVE_FREQ)
         parser.add_argument('--save_dir', help='The dir where weights saved.', type=str, default=SAVE_DIR)
         # group #4
         parser.add_argument('--init_weights', help='The path to the stored weights to init the model.', type=str, default=None)
@@ -166,6 +114,9 @@ if '__main__' == __name__:
         # group #1
         NAME = args.name
         assert len(NAME) > 0
+        ACT = args.act
+        if 'sigmoid' != ACT:
+            NAME += f'_{ACT}'
         memo = args.memo
         MEMO += '; ' + memo
         TEMP = args.temp
@@ -178,19 +129,19 @@ if '__main__' == __name__:
         n_batch_size = args.batch
         assert n_batch_size > 0
         lr = args.lr
-        gamma = args.gamma
+        GAMMA = args.gamma
         if lr is not None:
             assert lr > 0
             IS_SPEC_LR = True
         else:
             lr = LR
-        if gamma is not None:
-            assert 0 < gamma <= 1
+            if ACT == 'relu':
+                lr *= 0.1
+        if GAMMA is not None:
+            assert 0 < GAMMA <= 1
             IS_SPEC_GAMMA = True
-        else:
-            gamma = GAMMA
-        gamma_step = args.gamma_step
-        gamma_strategy = args.gamma_strategy
+        GAMMA_STEP = args.gamma_step
+        GAMMA_STRATEGY = args.gamma_strategy
         
         warmup = args.warmup
         
@@ -233,9 +184,9 @@ if '__main__' == __name__:
             'ver': VER,
             'batch_size': n_batch_size,
             'lr': lr,
-            'gamma': gamma,
-            'gamma_strategy': gamma_strategy,
-            'gamma_step': gamma_step,
+            'gamma': GAMMA,
+            'gamma_strategy': GAMMA_STRATEGY,
+            'gamma_step': GAMMA_STEP,
             'warmup': warmup,
             'n_epoch': n_epochs,
         }
@@ -269,9 +220,9 @@ if '__main__' == __name__:
                 if not IS_SPEC_LR:
                     lr = ts.params['lr']
                 if not IS_SPEC_GAMMA:
-                    gamma = ts.params['gamma']
-                    gamma_strategy = ts.params['gamma_strategy']
-                    gamma_step = ts.params['gamma_step']
+                    GAMMA = ts.params['gamma']
+                    GAMMA_STRATEGY = ts.params['gamma_strategy']
+                    GAMMA_STEP = ts.params['gamma_step']
                 print(f'Restored: lr={lr}, GAMMA={GAMMA}')
         print(f'CKPT_PATH={CKPT_PATH}')
         print('Use below CLI command to visualize this training by TVTS:')
@@ -279,7 +230,8 @@ if '__main__' == __name__:
             mongo_str = f'--host "{MONGODB_HOST}" --port {MONGODB_PORT}'
         else:
             mongo_str = f'--link "{link}"'
-        print(f'python3 /path/to/tvts/tvts.py {mongo_str} -m "loss|loss_val,top1|top1_val|top2|top2_val" --batch_metrics "loss,top1|top2" -k "top1_val" --save_dir "{SAVE_DIR}" "{NAME}"')
+        print(f'python3 /path/to/tvts/tvts.py {mongo_str} -m "loss|loss_val+0.5,top1|top1_val+0.5" --batch_metrics "loss,top1" -k "top1_val" --save_dir "{SAVE_DIR}" "{NAME}"')
+        print(f'ACT={ACT}')
         print('Allright? (y/[N]):', end='', flush=True)
         xinput = input().strip().lower()
         if 'y' != xinput:
@@ -298,8 +250,7 @@ if '__main__' == __name__:
         if not n_gpus:
             device_id = 'cpu'
         else:
-            # gpu_id = n_gpus - 1
-            gpu_id = 0
+            gpu_id = n_gpus - 1
             device_id = f'cuda:{gpu_id}'
         device = torch.device(device_id)
         visible_gpus = get_gpu_indexes_from_env()
@@ -309,24 +260,24 @@ if '__main__' == __name__:
 
         # the model
         sep('The model')
-        model = VGG(10, (3, 32, 32)).to(device)
+        mlp_conf = get_conf(ACT)
+        model = MLP(conf=mlp_conf).to(device)
         # print(model)
         model_dict = torch_compile(
-            ts, device, model, torch.nn.NLLLoss(),
-            torch.optim.Adam, ALPHA=lr, GAMMA=GAMMA, GAMMA_STRATEGY=gamma_strategy, GAMMA_STEP=gamma_step,
+            ts, device, model, torch.nn.CrossEntropyLoss(),
+            torch.optim.Adam, ALPHA=lr, GAMMA=GAMMA, GAMMA_STRATEGY=GAMMA_STRATEGY, GAMMA_STEP=GAMMA_STEP,
             warmup=warmup,
             metrics={
                 'top1': torch_acc_top1,
-                'top2': torch_acc_top2,
             },
         )
 
         # load data
         sep('The data')
-        x_train, y_train, x_test, y_test, label_names = cifar10.load()
-        shape_ = cifar10.shape_
+        x_train, y_train, x_test, y_test = mnist.load()
         N_SAMPLE_AMOUNT = len(x_train)
-        print('label_names', label_names)
+        N_INPUT = 28 * 28
+
         if TEMP:
             # This is the effect of the "temporary" code switch,
             # i.e. run on a small amount of data to just ensure the code is good.
@@ -336,8 +287,8 @@ if '__main__' == __name__:
             x_test = x_test[:N_SAMPLE_AMOUNT]
             y_test = y_test[:N_SAMPLE_AMOUNT]
         # reshape
-        x_train = x_train.reshape(-1, *shape_)
-        x_test = x_test.reshape(-1, *shape_)
+        x_train = x_train.reshape(-1, N_INPUT)
+        x_test = x_test.reshape(-1, N_INPUT)
         # to float
         x_train = uint8_to_flt_by_lut(x_train)
         x_test = uint8_to_flt_by_lut(x_test)
@@ -360,21 +311,6 @@ if '__main__' == __name__:
             print(f'Loading weight from {CKPT_PATH} ...')
             sdict = torch.load(CKPT_PATH)
 
-            # example: use former weights after added a dropout layer
-            if 0:
-                w21 = sdict['seq.21.weight']
-                b21 = sdict['seq.21.bias']
-                w23 = sdict['seq.23.weight']
-                b23 = sdict['seq.23.bias']
-                del sdict['seq.21.weight']
-                del sdict['seq.21.bias']
-                del sdict['seq.23.weight']
-                del sdict['seq.23.bias']
-                sdict['seq.22.weight'] = w21
-                sdict['seq.22.bias'] = b21
-                sdict['seq.24.weight'] = w23
-                sdict['seq.24.bias'] = b23
-
             model.load_state_dict(sdict)
             print('Loaded.')
         # model and data (end)
@@ -389,6 +325,7 @@ if '__main__' == __name__:
             if TEMP:
                 sep('(Temporary)', char='<', rchar='>')
             n_batches = int(np.floor(N_SAMPLE_AMOUNT / N_BATCH_SIZE))
+            n_batches = max(n_batches, 1)
             print('N_SAMPLE_AMOUNT:', N_SAMPLE_AMOUNT, file=sys.stderr)
             print('N_BATCH_SIZE:', N_BATCH_SIZE, file=sys.stderr)
             print('n_batches (per epoch):', n_batches, file=sys.stderr)
@@ -424,13 +361,13 @@ if '__main__' == __name__:
         for i in range(n_demo):
             spn += 1
             plt.subplot(spr, spc, spn)
-            htype = label_names[h_demo[i]]
-            gttype = label_names[y_demo[i]]
+            htype = str(h_demo[i])
+            gttype = str(y_demo[i, 0])
             right = True if htype == gttype else False
             title = gttype if right else f'{htype}(gt: {gttype})'
             plt.title(title, color="black" if right else "red")
             plt.axis('off')
-            plt.imshow(np.transpose(x_test[i].reshape(*shape_), (1, 2, 0)))
+            plt.imshow(np.transpose(x_test[i].reshape(28, 28), (0, 1)))
         print('Check and close the plotting window to continue ...')
         plt.show()
         # demo (end)

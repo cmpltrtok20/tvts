@@ -5,7 +5,8 @@ import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 from PyCmpltrtok.common import sep
 from PyCmpltrtok.common_np import uint8_to_flt_by_lut
-from PyCmpltrtok.common_torch import torch_compile, torch_acc_top1, torch_acc_top2, torch_fit, torch_evaluate, torch_infer
+from PyCmpltrtok.common_torch import torch_acc_top1, torch_acc_top2, torch_infer
+from PyCmpltrtok.common_accelerate import acc_compile, acc_fit, acc_evaluate
 from PyCmpltrtok.common_gpgpu import get_gpu_indexes_from_env
 import tvts.tvts as tvts
 
@@ -280,39 +281,49 @@ if '__main__' == __name__:
         else:
             mongo_str = f'--link "{link}"'
         print(f'python3 /path/to/tvts/tvts.py {mongo_str} -m "loss|loss_val,top1|top1_val|top2|top2_val" --batch_metrics "loss,top1|top2" -k "top1_val" --save_dir "{SAVE_DIR}" "{NAME}"')
-        print('Allright? (y/[N]):', end='', flush=True)
-        xinput = input().strip().lower()
-        if 'y' != xinput:
-            print("OK, let's stop it.")
-            sys.exit(0)
+
         # tvts init and resume (end)
         ###############################################################################################################
 
         ###############################################################################################################
         # model and data (start)
 
-        # select device
-        sep('cpu or gpu')
-        # device_id = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        n_gpus = torch.cuda.device_count()
-        if not n_gpus:
-            device_id = 'cpu'
-        else:
-            # gpu_id = n_gpus - 1
-            gpu_id = 0
-            device_id = f'cuda:{gpu_id}'
-        device = torch.device(device_id)
-        visible_gpus = get_gpu_indexes_from_env()
-        print(device)
-        if len(visible_gpus):
-            print(f'Device #{visible_gpus[-1]}')
-
         # the model
         sep('The model')
-        model = VGG(10, (3, 32, 32)).to(device)
+        model = VGG(10, (3, 32, 32))
         # print(model)
-        model_dict = torch_compile(
-            ts, device, model, torch.nn.NLLLoss(),
+        
+        # restore check point
+        if CKPT_PATH is None:
+            sep('From scratch')
+        else:
+            if not os.path.exists(CKPT_PATH):
+                raise tvts.TvtsException(f'CKPT {CKPT_PATH} does not exist!')
+            sep('Restore check point')
+            print(f'Loading weight from {CKPT_PATH} ...')
+            sdict = torch.load(CKPT_PATH)
+
+            # example: use former weights after added a dropout layer
+            if 0:
+                w21 = sdict['seq.21.weight']
+                b21 = sdict['seq.21.bias']
+                w23 = sdict['seq.23.weight']
+                b23 = sdict['seq.23.bias']
+                del sdict['seq.21.weight']
+                del sdict['seq.21.bias']
+                del sdict['seq.23.weight']
+                del sdict['seq.23.bias']
+                sdict['seq.22.weight'] = w21
+                sdict['seq.22.bias'] = b21
+                sdict['seq.24.weight'] = w23
+                sdict['seq.24.bias'] = b23
+
+            model.load_state_dict(sdict)
+            print('Loaded.')
+        
+        # acc compile
+        model_dict = acc_compile(
+            ts, model, torch.nn.NLLLoss(),
             torch.optim.Adam, ALPHA=lr, GAMMA=GAMMA, GAMMA_STRATEGY=gamma_strategy, GAMMA_STEP=gamma_step,
             warmup=warmup,
             metrics={
@@ -320,6 +331,15 @@ if '__main__' == __name__:
                 'top2': torch_acc_top2,
             },
         )
+        rank = model_dict['rank']
+                
+        # select device
+        sep('cpu or gpu')
+        n_gpus = torch.cuda.device_count()
+        print(f'N_GPUS = {n_gpus}')
+        device = model_dict['device']
+        print(f'device = {device}')
+        model = model_dict['o_model']
 
         # load data
         sep('The data')
@@ -350,33 +370,6 @@ if '__main__' == __name__:
         ds_test = TensorDataset(x_test, y_test)
         dl_test = DataLoader(ds_test, N_BATCH_SIZE, drop_last=False)
 
-        # restore check point
-        if CKPT_PATH is None:
-            sep('From scratch')
-        else:
-            if not os.path.exists(CKPT_PATH):
-                raise tvts.TvtsException(f'CKPT {CKPT_PATH} does not exist!')
-            sep('Restore check point')
-            print(f'Loading weight from {CKPT_PATH} ...')
-            sdict = torch.load(CKPT_PATH)
-
-            # example: use former weights after added a dropout layer
-            if 0:
-                w21 = sdict['seq.21.weight']
-                b21 = sdict['seq.21.bias']
-                w23 = sdict['seq.23.weight']
-                b23 = sdict['seq.23.bias']
-                del sdict['seq.21.weight']
-                del sdict['seq.21.bias']
-                del sdict['seq.23.weight']
-                del sdict['seq.23.bias']
-                sdict['seq.22.weight'] = w21
-                sdict['seq.22.bias'] = b21
-                sdict['seq.24.weight'] = w23
-                sdict['seq.24.bias'] = b23
-
-            model.load_state_dict(sdict)
-            print('Loaded.')
         # model and data (end)
         ###############################################################################################################
 
@@ -387,7 +380,7 @@ if '__main__' == __name__:
         else:
             sep('Train')
             if TEMP:
-                sep('(Temporary)', char='<', rchar='>')
+                sep('(Temporary)', char='[', rchar=']')
             n_batches = int(np.floor(N_SAMPLE_AMOUNT / N_BATCH_SIZE))
             print('N_SAMPLE_AMOUNT:', N_SAMPLE_AMOUNT, file=sys.stderr)
             print('N_BATCH_SIZE:', N_BATCH_SIZE, file=sys.stderr)
@@ -397,42 +390,44 @@ if '__main__' == __name__:
             ds_val = TensorDataset(x_test, y_test)
             dl_train = DataLoader(ds_train, N_BATCH_SIZE, drop_last=True, shuffle=True)
             dl_val = DataLoader(ds_val, N_BATCH_SIZE, drop_last=False)
-            torch_fit(model_dict, dl_train, dl_val, n_epochs)
+            acc_fit(model_dict, dl_train, dl_val, n_epochs)
         # train (end)
         ###############################################################################################################
 
         ###############################################################################################################
         # test (start)
-        sep('Test')
-        print('Evaluating ...')
-        avg_loss_test, avg_metric_test = torch_evaluate(model_dict, dl_test)
-        print(f'avg_loss_test={avg_loss_test}, avg_metric_test={avg_metric_test}')
+        if rank in set([0, -1]):
+            sep('Test')
+            print('Evaluating ...')
+            avg_loss_test, avg_metric_test = acc_evaluate(model_dict, dl_test)
+            print(f'avg_loss_test={avg_loss_test}, avg_metric_test={avg_metric_test}')
         # test (end)
         ###############################################################################################################
 
         ###############################################################################################################
         # demo (start)
-        sep('Demo')
-        spr = 4
-        spc = 5
-        spn = 0
-        plt.figure(figsize=[8, 6])
-        n_demo = spr * spc
-        x_demo = x_test.numpy()[:n_demo]
-        y_demo = y_test.numpy().astype(int)[:n_demo]
-        h_demo = torch_infer(x_demo, model, device, batch_size=8).argmax(axis=1)
-        for i in range(n_demo):
-            spn += 1
-            plt.subplot(spr, spc, spn)
-            htype = label_names[h_demo[i]]
-            gttype = label_names[y_demo[i]]
-            right = True if htype == gttype else False
-            title = gttype if right else f'{htype}(gt: {gttype})'
-            plt.title(title, color="black" if right else "red")
-            plt.axis('off')
-            plt.imshow(np.transpose(x_test[i].reshape(*shape_), (1, 2, 0)))
-        print('Check and close the plotting window to continue ...')
-        plt.show()
+        if rank in set([0, -1]):
+            sep('Demo')
+            spr = 4
+            spc = 5
+            spn = 0
+            plt.figure(figsize=[8, 6])
+            n_demo = spr * spc
+            x_demo = x_test.numpy()[:n_demo]
+            y_demo = y_test.numpy().astype(int)[:n_demo]
+            h_demo = torch_infer(x_demo, model, device, batch_size=8).argmax(axis=1)
+            for i in range(n_demo):
+                spn += 1
+                plt.subplot(spr, spc, spn)
+                htype = label_names[h_demo[i]]
+                gttype = label_names[y_demo[i]]
+                right = True if htype == gttype else False
+                title = gttype if right else f'{htype}(gt: {gttype})'
+                plt.title(title, color="black" if right else "red")
+                plt.axis('off')
+                plt.imshow(np.transpose(x_test[i].reshape(*shape_), (1, 2, 0)))
+            print('Check and close the plotting window to continue ...')
+            plt.show()
         # demo (end)
         ###############################################################################################################
 

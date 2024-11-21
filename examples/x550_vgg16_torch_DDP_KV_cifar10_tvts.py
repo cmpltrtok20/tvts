@@ -1,13 +1,74 @@
+"""
+Temporay:
+LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x550_vgg16_torch_DDP_KV_cifar10_tvts.py --temp -n 2
+LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x550_vgg16_torch_DDP_KV_cifar10_tvts.py --temp -n 2
+
+Former:
+LOCAL_RANK=0 RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x550_vgg16_torch_DDP_KV_cifar10_tvts.py -n 8 --batch 1024
+LOCAL_RANK=1 RANK=1 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 python x550_vgg16_torch_DDP_KV_cifar10_tvts.py -n 8 --batch 1024
+"""
+
 import os
 import sys
+import datetime
 import torch
+import torch.distributed as dist
 import numpy as np
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, distributed
 from PyCmpltrtok.common import sep
 from PyCmpltrtok.common_np import uint8_to_flt_by_lut
 from PyCmpltrtok.common_torch import torch_compile, torch_acc_top1, torch_acc_top2, torch_fit, torch_evaluate, torch_infer
 from PyCmpltrtok.common_gpgpu import get_gpu_indexes_from_env
 import tvts.tvts as tvts
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
+import pkg_resources as pkg
+import platform
+
+
+def emojis(str=''):
+    """Steal from YOLO v5"""
+    # Return platform-dependent emoji-safe version of string
+    return str.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str
+
+
+def check_version(current='0.0.0', minimum='0.0.0', name='version ', pinned=False, hard=False, verbose=False):
+    """Steal from YOLO v5"""
+    # Check version vs. required version
+    current, minimum = (pkg.parse_version(x) for x in (current, minimum))
+    result = (current == minimum) if pinned else (current >= minimum)  # bool
+    s = f'WARNING ⚠️ {name}{minimum} is required by YOLOv5, but {name}{current} is currently installed'  # string
+    if hard:
+        assert result, emojis(s)  # assert min requirements met
+    if verbose and not result:
+        print(s, file=sys.stderr)
+    return result
+
+
+def smart_DDP(model, local_rank):
+    """Steal from YOLO v5"""
+    # Model DDP creation with checks
+    assert not check_version(torch.__version__, '1.12.0', pinned=True), \
+        'torch==1.12.0 torchvision==0.13.0 DDP training is not supported due to a known issue. ' \
+        'Please upgrade or downgrade torch to use DDP. See https://github.com/ultralytics/yolov5/issues/8395'
+    if check_version(torch.__version__, '1.11.0'):
+        return DDP(model, device_ids=[local_rank], output_device=local_rank, static_graph=True)
+    else:
+        return DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+
+def setup(rank):
+    if -1 == rank:
+        return
+    dist.init_process_group("nccl", init_method='env://')
+
+
+def cleanup(rank):
+    if -1 == rank:
+        return
+    dist.destroy_process_group()
 
 
 ###############################################################################################################
@@ -106,6 +167,7 @@ class VGG(torch.nn.Module):
 
 
 if '__main__' == __name__:
+
     import matplotlib.pyplot as plt
     import argparse
     import PyCmpltrtok.data.cifar10.load_cifar10 as cifar10
@@ -113,20 +175,14 @@ if '__main__' == __name__:
 
     def _main():
         """ The main program. """
-        sep('VGG16 by PyTorch on Cifar10 with TVTS')
 
         ###############################################################################################################
         # Hyper params and switches (start)
         sep('Decide hyper params')
         VER = 'v3.0'  # version info of this code file
         MEMO = VER  # default memo
-        N_BATCH_SIZE = 256
-        N_EPOCHS = 4
         LR = 0.001  # default init learning rate
-        GAMMA = 0.98  # default multiplicative factor of learning rate decay per epoch
-        GAMMA_STRATEGY = 'step'
-        GAMMA_STEP = 32
-        WARMUP = 128
+        GAMMA = 0.95  # default multiplicative factor of learning rate decay per epoch
         print(f'Default LR={LR}, GAMMA={GAMMA}')
         IS_SPEC_LR = False  # is manually specified the LR
         IS_SPEC_GAMMA = False  # is manually specified the GAMMA
@@ -138,18 +194,15 @@ if '__main__' == __name__:
         # specify or override params from CLI
         parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
         # group #1
-        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_vgg16_torch_cifar10')
+        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_vgg16_torch_cifar10_DDP')
         parser.add_argument('--memo', help='The memo.', type=str, default='(no memo)')
         parser.add_argument('--temp', help='Run as temporary code', action='store_true')
         parser.add_argument('-t', '--test', help='Only run testing phase, no training.', action='store_true')
         # group #2
-        parser.add_argument('-n', '--epochs', help='How many epoches to train.', type=int, default=N_EPOCHS)
-        parser.add_argument('--batch', help='Batch size.', type=int, default=N_BATCH_SIZE)
+        parser.add_argument('-n', '--epochs', help='How many epoches to train.', type=int, default=2)
+        parser.add_argument('--batch', help='Batch size.', type=int, default=256)
         parser.add_argument('--lr', help='Learning rate.', type=float, default=None)
-        parser.add_argument('--warmup', help='Warmup step(s) or epoch(s)depending on --gamma-strategy.', type=int, default=WARMUP)
         parser.add_argument('--gamma', help='Multiplicative factor of learning rate decay per epoch.', type=float, default=None)
-        parser.add_argument('--gamma_strategy', help='Step Gamma LR scheduler on step(s) or epoch(s)', type=str, default=GAMMA_STRATEGY)
-        parser.add_argument('--gamma_step', help='Step Gamma LR scheduler per --gamma-step steps of step(s) or epoch(s) depending on --gamma-strategy.', type=int, default=GAMMA_STEP)
         # group #3
         parser.add_argument('--pi', help='id of the parent training', type=int, default=0)
         parser.add_argument('--pe', help='parent epoch of the parent training', type=int, default=0)
@@ -166,6 +219,50 @@ if '__main__' == __name__:
         # group #1
         NAME = args.name
         assert len(NAME) > 0
+        
+        # Ensure args are identical.
+        sep('Check if all args match between processes')
+        keys = sorted(args.__dict__.keys())
+        xdict = {}
+        for k in keys:
+            xdict[k] = args.__dict__[k]
+        xdict_value = f'{xdict}'
+        this_path = os.path.abspath(__file__)
+        redis_key = f'{this_path}:{NAME}'
+        
+        # get env variables
+        timeout = 10
+        sep(f'Ensure parameter consistencies via torch.distributed.TCPStore (Master first is recommended. Each client should reach the master in {timeout} seconds.)')
+        try:
+            local_rank, rank, world_size = 0, -1, 1
+            local_rank, rank, world_size = [int(x) for x in (os.environ['LOCAL_RANK'], os.environ['RANK'], os.environ['WORLD_SIZE'],)]
+        except Exception as ex:
+            print(ex, file=sys.stderr)
+        dist_host = os.environ['MASTER_ADDR']
+        dist_port = int(os.environ['MASTER_PORT']) + 1
+        is_master = not rank
+        
+        rdb = dist.TCPStore(dist_host, dist_port, is_master=is_master, timeout=datetime.timedelta(seconds=timeout), wait_for_workers=False)
+        if is_master:
+            rdb.set(redis_key, xdict_value.encode('utf8'))
+            print('The master process')
+        else:
+            redis_value = rdb.get(redis_key)
+            redis_value = redis_value.decode('utf8')
+            print('Redis:', redis_value)
+            print('This :', xdict_value)
+            assert redis_value == xdict_value, 'All arguments of all processes must match!'
+            print('OK')
+        
+        sep('VGG16 by PyTorch DDP on Cifar10 with TVTS')
+        flag = f'{local_rank}/{rank}/{world_size}'
+        sep(f'{flag} start')
+        setup(rank)
+        print(flag, 'init_process_group done')
+        print(f'Removing Redis arg checking item {redis_key}')
+        # rdb.delete(redis_key)  # redis
+        rdb.delete_key(redis_key)  # TCPStore
+        
         memo = args.memo
         MEMO += '; ' + memo
         TEMP = args.temp
@@ -173,32 +270,31 @@ if '__main__' == __name__:
             MEMO = '(Temporary) ' + MEMO
         TEST = args.test
         # group #2
-        n_epochs = args.epochs
-        assert n_epochs >= 0
-        n_batch_size = args.batch
-        assert n_batch_size > 0
+        N_EPOCHS = args.epochs
+        assert N_EPOCHS >= 0
+        N_BATCH_SIZE = args.batch
+        assert N_BATCH_SIZE > 0
         lr = args.lr
         gamma = args.gamma
         if lr is not None:
             assert lr > 0
+            LR = lr
             IS_SPEC_LR = True
-        else:
-            lr = LR
         if gamma is not None:
             assert 0 < gamma <= 1
+            GAMMA = gamma
             IS_SPEC_GAMMA = True
-        else:
-            gamma = GAMMA
-        gamma_step = args.gamma_step
-        gamma_strategy = args.gamma_strategy
-        
-        warmup = args.warmup
-        
-        IS_TRAIN = not not n_epochs
+        IS_TRAIN = not not N_EPOCHS
         if TEST:
             IS_TRAIN = 0
         if not IS_TRAIN:
             sep('No training, just testing and demonstrating', char='<', rchar='>')
+            if -1 != rank:
+                print(f'Now, WORLD_SIZE={world_size}, and evaluation mode should not be in parallel!', file=sys.stderr)
+                exit(-2)
+        elif -1 == rank:
+            print('This program is intented for DDP!', file=sys.stderr)
+            exit(-3)
         # group #3
         PARENT_TRAIN_ID = args.pi
         PARENT_EPOCH = args.pe
@@ -231,13 +327,10 @@ if '__main__' == __name__:
         sep('TVTS init')
         xparams={
             'ver': VER,
-            'batch_size': n_batch_size,
-            'lr': lr,
-            'gamma': gamma,
-            'gamma_strategy': gamma_strategy,
-            'gamma_step': gamma_step,
-            'warmup': warmup,
-            'n_epoch': n_epochs,
+            'batch_size': N_BATCH_SIZE,
+            'lr': LR,
+            'gamma': GAMMA,
+            'n_epoch': N_EPOCHS,
         }
         ts = tvts.Tvts(
             NAME,
@@ -253,8 +346,7 @@ if '__main__' == __name__:
         print(f'MONGODB_HOST={MONGODB_HOST}, MONGODB_PORT={MONGODB_PORT}, NAME={NAME}, MEMO={MEMO}, TEMP={TEMP}')
         print(f'SAVE_FREQ={SAVE_FREQ}, SAVE_DIR={SAVE_DIR}')
         print(f'INIT_WEIGHTS={INIT_WEIGHTS}')
-        for k in sorted(xparams.keys()):
-            print(f"{k} = |{xparams[k]}|")
+        print(xparams)
         # tvts resume
         CKPT_PATH = None
         if INIT_WEIGHTS:
@@ -265,14 +357,11 @@ if '__main__' == __name__:
                 print(f'PARENT_TRAIN_ID={PARENT_TRAIN_ID}, PARENT_EPOCH={PARENT_EPOCH}')
                 rel_path, _ = ts.resume(PARENT_TRAIN_ID, PARENT_EPOCH, keys_of_data_to_restore=['lr', 'gamma'])
                 CKPT_PATH = os.path.join(SAVE_DIR, rel_path)
-                warmup = 0
                 if not IS_SPEC_LR:
-                    lr = ts.params['lr']
+                    LR = ts.params['lr']
                 if not IS_SPEC_GAMMA:
-                    gamma = ts.params['gamma']
-                    gamma_strategy = ts.params['gamma_strategy']
-                    gamma_step = ts.params['gamma_step']
-                print(f'Restored: lr={lr}, GAMMA={GAMMA}')
+                    GAMMA = ts.params['gamma']
+                print(f'Restored: LR={LR}, GAMMA={GAMMA}')
         print(f'CKPT_PATH={CKPT_PATH}')
         print('Use below CLI command to visualize this training by TVTS:')
         if link is None:
@@ -280,11 +369,6 @@ if '__main__' == __name__:
         else:
             mongo_str = f'--link "{link}"'
         print(f'python3 /path/to/tvts/tvts.py {mongo_str} -m "loss|loss_val,top1|top1_val|top2|top2_val" --batch_metrics "loss,top1|top2" -k "top1_val" --save_dir "{SAVE_DIR}" "{NAME}"')
-        print('Allright? (y/[N]):', end='', flush=True)
-        xinput = input().strip().lower()
-        if 'y' != xinput:
-            print("OK, let's stop it.")
-            sys.exit(0)
         # tvts init and resume (end)
         ###############################################################################################################
 
@@ -296,10 +380,9 @@ if '__main__' == __name__:
         # device_id = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         n_gpus = torch.cuda.device_count()
         if not n_gpus:
-            device_id = 'cpu'
+            raise Exception('You must have one or more GPU to use this program.')
         else:
-            # gpu_id = n_gpus - 1
-            gpu_id = 0
+            gpu_id = local_rank
             device_id = f'cuda:{gpu_id}'
         device = torch.device(device_id)
         visible_gpus = get_gpu_indexes_from_env()
@@ -310,15 +393,18 @@ if '__main__' == __name__:
         # the model
         sep('The model')
         model = VGG(10, (3, 32, 32)).to(device)
+        if -1 != rank:
+            dist.barrier()  # Synchronizes all processes.
+            model = smart_DDP(model, local_rank)
         # print(model)
         model_dict = torch_compile(
             ts, device, model, torch.nn.NLLLoss(),
-            torch.optim.Adam, ALPHA=lr, GAMMA=GAMMA, GAMMA_STRATEGY=gamma_strategy, GAMMA_STEP=gamma_step,
-            warmup=warmup,
+            torch.optim.Adam, ALPHA=LR, GAMMA=GAMMA,
             metrics={
                 'top1': torch_acc_top1,
                 'top2': torch_acc_top2,
             },
+            rank=rank
         )
 
         # load data
@@ -342,13 +428,19 @@ if '__main__' == __name__:
         x_train = uint8_to_flt_by_lut(x_train)
         x_test = uint8_to_flt_by_lut(x_test)
         # to tensor
-        x_train = torch.Tensor(x_train)
-        x_test = torch.Tensor(x_test)
-        y_train = torch.Tensor(y_train)
-        y_test = torch.Tensor(y_test)
+        if -1 == rank:
+            x_train = torch.Tensor(x_train)
+            x_test = torch.Tensor(x_test)
+            y_train = torch.Tensor(y_train)
+            y_test = torch.Tensor(y_test)
+        else:
+            x_train = torch.Tensor(x_train).to(local_rank)
+            x_test = torch.Tensor(x_test).to(local_rank)
+            y_train = torch.Tensor(y_train).to(local_rank)
+            y_test = torch.Tensor(y_test).to(local_rank)
         # to Dataset
         ds_test = TensorDataset(x_test, y_test)
-        dl_test = DataLoader(ds_test, N_BATCH_SIZE, drop_last=False)
+        dl_test = DataLoader(ds_test, N_BATCH_SIZE, drop_last=False, shuffle=False)
 
         # restore check point
         if CKPT_PATH is None:
@@ -395,9 +487,14 @@ if '__main__' == __name__:
         
             ds_train = TensorDataset(x_train, y_train)
             ds_val = TensorDataset(x_test, y_test)
-            dl_train = DataLoader(ds_train, N_BATCH_SIZE, drop_last=True, shuffle=True)
-            dl_val = DataLoader(ds_val, N_BATCH_SIZE, drop_last=False)
-            torch_fit(model_dict, dl_train, dl_val, n_epochs)
+            if -1 == rank:
+                dl_train = DataLoader(ds_train, N_BATCH_SIZE, drop_last=True, shuffle=True)
+                dl_val = DataLoader(ds_val, N_BATCH_SIZE, drop_last=False, shuffle=False)
+            else:
+                dl_train = DataLoader(ds_train, N_BATCH_SIZE, drop_last=True, shuffle=False, sampler=distributed.DistributedSampler(ds_train, shuffle=True))
+                dl_val = DataLoader(ds_val, N_BATCH_SIZE, drop_last=False, shuffle=False)
+            dist.barrier()  # Synchronizes all processes.
+            torch_fit(model_dict, dl_train, dl_val, N_EPOCHS, world_size=world_size)
         # train (end)
         ###############################################################################################################
 
@@ -412,29 +509,35 @@ if '__main__' == __name__:
 
         ###############################################################################################################
         # demo (start)
-        sep('Demo')
-        spr = 4
-        spc = 5
-        spn = 0
-        plt.figure(figsize=[8, 6])
-        n_demo = spr * spc
-        x_demo = x_test.numpy()[:n_demo]
-        y_demo = y_test.numpy().astype(int)[:n_demo]
-        h_demo = torch_infer(x_demo, model, device, batch_size=8).argmax(axis=1)
-        for i in range(n_demo):
-            spn += 1
-            plt.subplot(spr, spc, spn)
-            htype = label_names[h_demo[i]]
-            gttype = label_names[y_demo[i]]
-            right = True if htype == gttype else False
-            title = gttype if right else f'{htype}(gt: {gttype})'
-            plt.title(title, color="black" if right else "red")
-            plt.axis('off')
-            plt.imshow(np.transpose(x_test[i].reshape(*shape_), (1, 2, 0)))
-        print('Check and close the plotting window to continue ...')
-        plt.show()
+        if rank in set([0, -1]):
+            sep('Demo')
+            spr = 4
+            spc = 5
+            spn = 0
+            plt.figure(figsize=[8, 6])
+            n_demo = spr * spc
+            x_demo = x_test.cpu().numpy()[:n_demo]
+            y_demo = y_test.cpu().numpy().astype(int)[:n_demo]
+            h_demo = torch_infer(x_demo, model, device, batch_size=8).argmax(axis=1)
+            for i in range(n_demo):
+                spn += 1
+                plt.subplot(spr, spc, spn)
+                htype = label_names[h_demo[i]]
+                gttype = label_names[y_demo[i]]
+                right = True if htype == gttype else False
+                title = gttype if right else f'{htype}(gt: {gttype})'
+                plt.title(title, color="black" if right else "red")
+                plt.axis('off')
+                plt.imshow(np.transpose(x_demo[i].reshape(*shape_), (1, 2, 0)))
+            print('Check and close the plotting window to continue ...')
+            plt.show()
         # demo (end)
         ###############################################################################################################
+
+        sep(f'{flag} start cleanup')
+        cleanup(rank)
+        sep(f'{flag} cleanup end')
+        sep(f'{flag} end')
 
     _main()  # Main program entrance
     sep('All over')

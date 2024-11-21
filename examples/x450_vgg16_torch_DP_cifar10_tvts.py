@@ -1,7 +1,9 @@
 import os
 import sys
+import time
 import torch
 import numpy as np
+import torch
 from torch.utils.data import TensorDataset, DataLoader
 from PyCmpltrtok.common import sep
 from PyCmpltrtok.common_np import uint8_to_flt_by_lut
@@ -138,7 +140,7 @@ if '__main__' == __name__:
         # specify or override params from CLI
         parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
         # group #1
-        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_vgg16_torch_cifar10')
+        parser.add_argument('--name', help='The name of this training, VERY important to TVTS.', type=str, default='tvts_ex_vgg16_torch_DP_cifar10')
         parser.add_argument('--memo', help='The memo.', type=str, default='(no memo)')
         parser.add_argument('--temp', help='Run as temporary code', action='store_true')
         parser.add_argument('-t', '--test', help='Only run testing phase, no training.', action='store_true')
@@ -280,17 +282,7 @@ if '__main__' == __name__:
         else:
             mongo_str = f'--link "{link}"'
         print(f'python3 /path/to/tvts/tvts.py {mongo_str} -m "loss|loss_val,top1|top1_val|top2|top2_val" --batch_metrics "loss,top1|top2" -k "top1_val" --save_dir "{SAVE_DIR}" "{NAME}"')
-        print('Allright? (y/[N]):', end='', flush=True)
-        xinput = input().strip().lower()
-        if 'y' != xinput:
-            print("OK, let's stop it.")
-            sys.exit(0)
-        # tvts init and resume (end)
-        ###############################################################################################################
-
-        ###############################################################################################################
-        # model and data (start)
-
+        
         # select device
         sep('cpu or gpu')
         # device_id = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -305,11 +297,30 @@ if '__main__' == __name__:
         visible_gpus = get_gpu_indexes_from_env()
         print(device)
         if len(visible_gpus):
+            print(f'visible_gpus = {visible_gpus}')
             print(f'Device #{visible_gpus[-1]}')
+        # Data Parallel
+        device_ids = list(range(n_gpus))
+        print(f'device_ids={device_ids}')
+        output_device = device_id
+        print(f'output_device={output_device}')
+        
+        print('Allright? (y/[N]):', end='', flush=True)
+        xinput = input().strip().lower()
+        if 'y' != xinput:
+            print("OK, let's stop it.")
+            sys.exit(0)
+        # tvts init and resume (end)
+        ###############################################################################################################
+
+        ###############################################################################################################
+        # model and data (start)
 
         # the model
         sep('The model')
         model = VGG(10, (3, 32, 32)).to(device)
+        model = torch.nn.DataParallel(model, device_ids, output_device)
+        
         # print(model)
         model_dict = torch_compile(
             ts, device, model, torch.nn.NLLLoss(),
